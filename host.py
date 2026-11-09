@@ -7,6 +7,7 @@ so the conversation lives in sandbox globals and can be dumped between turns or 
 import argparse
 import asyncio
 import base64
+import contextvars
 import hashlib
 import hmac
 import json
@@ -18,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self
 
+import logfire
 from pydantic_ai.direct import model_request as direct_model_request
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.models import Model, ModelRequestParameters, infer_model
@@ -29,9 +31,11 @@ from pydantic_monty import (
     AsyncFunctionSnapshot,
     AsyncMonty,
     AsyncMontySession,
+    CollectString,
     ExternalModule,
     MemoryFile,
     MontyComplete,
+    MontyError,
     MountDir,
     OSAccess,
     ResourceLimits,
@@ -48,8 +52,18 @@ history = result.all_messages()
 result.output
 """
 
+# A child sandbox gets less than its parent: it runs model-written code with nothing to reach.
+CHILD_LIMITS = ResourceLimits(max_memory=50_000_000, max_feed_duration_secs=10)
+CHILD_OUTPUT_BYTES = 64_000
+
 WorkspaceMode = Literal['overlay', 'read-write', 'memory']
 Files = dict[str, str | bytes]
+
+
+def configure_logfire() -> None:
+    """Export host spans and model requests when LOGFIRE_TOKEN is set; sandbox sessions join the same trace."""
+    logfire.configure(send_to_logfire='if-token-present', service_name='monty-agent-host', console=False)
+    logfire.instrument_pydantic_ai()
 
 
 def log(msg: str) -> None:
@@ -87,6 +101,13 @@ class State:
         if encoded is None:
             return None
         return {p: c['text'] if 'text' in c else base64.b64decode(c['base64']) for p, c in encoded.items()}
+
+
+@dataclass
+class Suspended:
+    """A turn stopped before a model request; `checkpoint` restarts it, with any model (a fork)."""
+
+    checkpoint: Path
 
 
 @dataclass
@@ -133,8 +154,9 @@ class Sandbox:
     env: dict[str, str] = field(default_factory=dict)
     verbose: bool = False
     limits: ResourceLimits | None = None
+    remote: str | None = None
 
-    def host_module(self) -> ExternalModule:
+    def host_module(self, pool: Any = None) -> ExternalModule:
         def prepare(model: str | None, messages: list[dict], params: dict):
             resolved = resolve_model(self.model or model or 'test')
             if self.verbose:
@@ -144,15 +166,35 @@ class Sandbox:
 
         def model_request(model: str | None, messages: list[dict], params: dict) -> dict:
             # Monty calls sync host functions on the running loop, so the request gets a loop of its own.
+            run = contextvars.copy_context().run
             with ThreadPoolExecutor(1) as executor:
-                return executor.submit(asyncio.run, model_request_async(model, messages, params)).result()
+                return executor.submit(run, asyncio.run, model_request_async(model, messages, params)).result()
 
         async def model_request_async(model: str | None, messages: list[dict], params: dict) -> dict:
             resolved, history, parameters = prepare(model, messages, params)
             response = await direct_model_request(resolved, history, model_request_parameters=parameters)
             return to_jsonable_python(response)
 
-        return ExternalModule({'model_request': model_request, 'model_request_async': model_request_async})
+        async def run_python(code: str) -> dict:
+            """Run `code` in a fresh child sandbox from the same pool: no files, env or host functions."""
+            if self.verbose:
+                log(f'run_python {len(code)} chars')
+            stdout = CollectString(max_bytes=CHILD_OUTPUT_BYTES)
+            checkout = {'ephemeral': True} if self.remote else {}
+            with logfire.span('child sandbox', code=code) as span:
+                try:
+                    async with pool.checkout(script_name='child.py', limits=CHILD_LIMITS, **checkout) as child:
+                        output = await child.feed_run(code, print_callback=stdout)
+                    result = {'output': repr(output), 'stdout': stdout.output}
+                except MontyError as error:
+                    result = {'error': f'{type(error).__name__}: {error}', 'stdout': stdout.output}
+                span.set_attribute('result', result)
+            return result
+
+        functions = {'model_request': model_request, 'model_request_async': model_request_async}
+        if pool is not None:
+            functions['run_python'] = run_python
+        return ExternalModule(functions)
 
     def mounts(self) -> list[MountDir]:
         mounts = [MountDir(host_path=SANDBOX_DIR, virtual_path='/app', mode='read-only')]
@@ -195,20 +237,28 @@ class AgentSession:
     async def __aenter__(self) -> Self:
         self._mounts = [self._stack.enter_context(m) for m in self.sandbox.mounts()]
         self._set_files(self.sandbox.seed_files())
-        pool = await self._stack.enter_async_context(AsyncMonty())
+        pool = await self._stack.enter_async_context(self._pool())
         self._session: AsyncMontySession = await self._stack.enter_async_context(
-            pool.checkout(limits=self.sandbox.limits, external_modules={'host': self.sandbox.host_module()})
+            pool.checkout(limits=self.sandbox.limits, external_modules={'host': self.sandbox.host_module(pool)})
         )
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
         await self._stack.aclose()
 
+    def _pool(self) -> Any:
+        if not self.sandbox.remote:
+            return AsyncMonty()
+        # LOGFIRE_API_KEY: a project (not personal) key with `project:execute_agent_sandboxes`.
+        return logfire.agent_sandboxes(url=self.sandbox.remote, auto_resume=False)
+
     async def start(self, script: Path) -> None:
         await self._feed(SETUP + script.read_text(), {})
 
-    async def send(self, prompt: str, checkpoints: StateStore | None = None) -> Any:
-        return await self._feed(TURN, {'prompt': prompt}, checkpoints)
+    async def send(self, prompt: str, checkpoints: StateStore | None = None, suspend_at: int | None = None) -> Any:
+        """Run one turn; with `suspend_at=n`, stop before its n-th model request and return `Suspended`."""
+        with logfire.span('agent turn {prompt}', prompt=prompt):
+            return await self._feed(TURN, {'prompt': prompt}, checkpoints, suspend_at)
 
     async def dump(self) -> State:
         """Idle-session state between turns: agent, tools, history and the in-memory workspace."""
@@ -221,12 +271,14 @@ class AgentSession:
     async def restore(self, checkpoint: State) -> None:
         """Load a mid-turn checkpoint; `resume` then re-issues its pending model request."""
         self._set_files(checkpoint.files)
+        logfire.info('restore checkpoint')
         self._pending = await self._session.load_snapshot(checkpoint.monty, mount=self._mounts, os=self._handle_os)
 
-    async def resume(self, checkpoints: StateStore | None = None) -> Any:
+    async def resume(self, checkpoints: StateStore | None = None, suspend_at: int | None = None) -> Any:
         snapshot, self._pending = self._pending, None
         assert snapshot is not None, 'nothing to resume; call restore() first'
-        return await self._drive(snapshot, checkpoints)
+        with logfire.span('agent resume'):
+            return await self._drive(snapshot, checkpoints, suspend_at)
 
     async def history(self) -> list[dict]:
         return await self._feed('dump_messages(history)', {})
@@ -259,16 +311,25 @@ class AgentSession:
             return self._fs(name=name, args=args, **kwargs)
         return NOT_HANDLED
 
-    async def _feed(self, code: str, inputs: dict, checkpoints: StateStore | None = None) -> Any:
+    async def _feed(
+        self, code: str, inputs: dict, checkpoints: StateStore | None = None, suspend_at: int | None = None
+    ) -> Any:
         snapshot = await self._session.feed_start(code, inputs=inputs, mount=self._mounts, os=self._handle_os)
-        return await self._drive(snapshot, checkpoints)
+        return await self._drive(snapshot, checkpoints, suspend_at)
 
-    async def _drive(self, snapshot: Any, checkpoints: StateStore | None) -> Any:
+    async def _drive(self, snapshot: Any, checkpoints: StateStore | None, suspend_at: int | None = None) -> Any:
+        assert suspend_at is None or checkpoints, 'suspending needs a checkpoint store'
+        step = 0
         while not isinstance(snapshot, MontyComplete):
             if checkpoints and isinstance(snapshot, AsyncFunctionSnapshot) and snapshot.function_name in MODEL_REQUEST:
+                step += 1
                 path = checkpoints.save(State(snapshot.dump(), self.files()), {'messages': len(snapshot.args[1])})
+                logfire.info('checkpoint {step}', step=step, path=str(path))
                 if self.sandbox.verbose:
                     log(f'checkpoint {path}')
+                if step == suspend_at:
+                    logfire.info('suspended before model request {step}', step=step)
+                    return Suspended(path)
             snapshot = await snapshot.resume_auto()
         return snapshot.output
 
@@ -291,19 +352,23 @@ async def cli(args: argparse.Namespace) -> Any:
         env={k: os.environ[k] for k in args.env if k in os.environ},
         verbose=args.verbose,
         limits=ResourceLimits(max_memory=100_000_000, max_feed_duration_secs=30),
+        remote=args.remote,
     )
     key = os.environ.get('MONTY_AGENT_KEY', '').encode() or None
     checkpoints = StateStore(args.checkpoints, key) if args.checkpoints else None
     async with sandbox.session() as session:
         if args.resume:
             await session.restore(StateStore(args.resume.parent, key).load(args.resume))
-            output = await session.resume(checkpoints)
+            output = await session.resume(checkpoints, args.suspend_at)
         else:
             if args.state and args.state.exists():
                 await session.load(StateStore(args.state.parent, key).load(args.state))
             else:
                 await session.start(args.script)
-            output = await session.send(args.prompt, checkpoints)
+            output = await session.send(args.prompt, checkpoints, args.suspend_at)
+        if isinstance(output, Suspended):
+            log(f'suspended; continue or fork with --resume {output.checkpoint}')
+            return None
         if args.state:
             StateStore(args.state.parent, key).save(await session.dump(), name=args.state.stem)
         return output
@@ -320,12 +385,22 @@ def main() -> None:
     parser.add_argument('--state', type=Path, help='idle session file (.monty): loaded if present, saved after')
     parser.add_argument('--checkpoints', type=Path, help='directory for a checkpoint before every model request')
     parser.add_argument('--resume', type=Path, help='checkpoint to restore and finish (fork / roll back)')
+    parser.add_argument(
+        '--suspend-at', type=int, metavar='N', help='stop before the N-th model request (needs --checkpoints)'
+    )
+    parser.add_argument(
+        '--remote', metavar='URL', help='run in Logfire Agent Sandboxes, e.g. https://logfire-eu.pydantic.info/'
+    )
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
     if not args.resume and not (args.script and args.prompt):
         parser.error('script and prompt are required unless --resume is given')
+    if args.suspend_at and not args.checkpoints:
+        parser.error('--suspend-at needs --checkpoints')
 
-    output = asyncio.run(cli(args))
+    configure_logfire()
+    with logfire.span('monty-agent {script}', script=str(args.script or args.resume)):
+        output = asyncio.run(cli(args))
     if output is not None:
         print(getattr(output, 'attributes', output))
 

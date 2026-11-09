@@ -16,9 +16,13 @@ classifiers = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "logfire>=5.5.0",
     "pydantic-ai-slim[anthropic,openai]>=2.66.0",
     "pydantic-monty>=1.5.0",
 ]
+
+[project.optional-dependencies]
+remote = ["logfire[agent-sandboxes]>=5.5.0"]
 
 [project.urls]
 Repository = "https://github.com/jirikuncar/monty-agent"
@@ -44,3 +48,6 @@ extend-select = ["I", "UP", "B"]
 [tool.ruff.lint.per-file-ignores]
 "examples/*" = ["F821", "B018"]  # sandbox scripts get `prompt` as input and return their last expression
 "sandbox/*" = ["BLE001"]  # no exception subclasses in Monty, so any tool error becomes a retry
+
+[tool.logfire]
+ignore_no_config = true

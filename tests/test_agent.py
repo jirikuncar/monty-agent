@@ -6,11 +6,12 @@ from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelRe
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_monty import MontyRuntimeError
 
-from host import Sandbox, State, StateStore, run, run_once
+from host import Sandbox, State, StateStore, Suspended, run, run_once
 
 EXAMPLES = Path(__file__).parents[1] / 'examples'
 NOTES_AGENT = EXAMPLES / 'notes_agent.py'
 LOG_AGENT = Path(__file__).parent / 'agents' / 'log_agent.py'
+CODE_AGENT = EXAMPLES / 'code_agent.py'
 
 pytestmark = pytest.mark.anyio
 
@@ -106,6 +107,22 @@ async def test_history_is_pydantic_ai_compatible():
     assert [p.content for m in history for p in m.parts if p.part_kind == 'user-prompt'] == ['hello', 'again']
 
 
+def test_child_sandbox_runs_code_isolated(tmp_path: Path):
+    programs = ['1 / 0', "open('/app/pydantic_ai_lite.py').read()", 'print("hi")\nsum(range(10))']
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        returns = [p.content for m in messages for p in m.parts if p.part_kind == 'tool-return']
+        if len(returns) < len(programs):
+            return ModelResponse(parts=[ToolCallPart('run_python', {'code': programs[len(returns)]})])
+        return ModelResponse(parts=[ToolCallPart('final_result', {'answer': repr(returns), 'code': programs[-1]})])
+
+    output = run(CODE_AGENT, prompt='go', model=FunctionModel(respond)).attributes
+    zero, isolated, ok = eval(output['answer'])
+    assert 'ZeroDivisionError' in zero['error']
+    assert 'error' in isolated  # the parent's /app mount is not visible to the child
+    assert ok == {'output': '45', 'stdout': 'hi\n'}
+
+
 async def checkpointed_run(tmp_path: Path, mode: str, workspace: Path) -> StateStore:
     store = StateStore(tmp_path / f'checkpoints-{mode}')
     sandbox = Sandbox(model=appender('step'), workspace=workspace, workspace_mode=mode)
@@ -140,6 +157,20 @@ async def test_fork_is_independent(tmp_path: Path, workspace: Path):
     original = await resume(Sandbox(model=appender('step'), workspace_mode='memory'), middle)
     assert forked == ('done 3', {'/workspace/todo.txt': 'buy milk', '/workspace/log.txt': 'step1\nfork2\nfork3\n'})
     assert original[1]['/workspace/log.txt'] == 'step1\nstep2\n'
+
+
+async def test_suspend_then_restart(tmp_path: Path, workspace: Path):
+    store = StateStore(tmp_path / 'steps')
+    sandbox = Sandbox(model=appender('step'), workspace=workspace, workspace_mode='memory')
+    async with sandbox.session() as session:
+        await session.start(LOG_AGENT)
+        suspended = await session.send('go', store, suspend_at=2)
+    assert suspended == Suspended(store.paths()[1])
+    assert len(store.paths()) == 2
+    assert await resume(sandbox, store.load(suspended.checkpoint)) == (
+        'done 2',
+        {'/workspace/todo.txt': 'buy milk', '/workspace/log.txt': 'step1\nstep2\n'},
+    )
 
 
 async def test_rollback_read_write_replays_side_effects(tmp_path: Path, workspace: Path):
