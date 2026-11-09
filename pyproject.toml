@@ -1,0 +1,46 @@
+[project]
+name = "monty-agent"
+version = "0.1.0"
+description = "A minimal Pydantic AI subset that runs inside the Monty sandbox, with every external call answered by the host"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jiri Kuncar", email = "jiri@pydantic.dev" }]
+keywords = ["pydantic-ai", "monty", "sandbox", "agents", "llm"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Interpreters",
+]
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic-ai-slim[anthropic,openai]>=2.66.0",
+    "pydantic-monty>=1.5.0",
+]
+
+[project.urls]
+Repository = "https://github.com/jirikuncar/monty-agent"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.4",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.ruff.lint]
+extend-select = ["I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/*" = ["F821", "B018"]  # sandbox scripts get `prompt` as input and return their last expression
+"sandbox/*" = ["BLE001"]  # no exception subclasses in Monty, so any tool error becomes a retry
