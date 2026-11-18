@@ -358,6 +358,7 @@ class MontyTui(App[str | None]):
     .entry Markdown { margin: 0; padding: 0; }
     .entry:focus { background: $boost; }
     .entry.picked { border: double $accent; }
+    .entry.model.picked, .entry.fork.picked { height: auto; color: $text; }
     .entry.model.expanded { height: auto; border: round $panel-lighten-2; color: $text; padding: 0 1; }
     .entry.model.sub { margin-left: 4; }
     .entry .returned { color: $text-muted; }
@@ -1108,8 +1109,8 @@ class MontyTui(App[str | None]):
             return False
         if not text and (node is None or node.kind != 'model'):
             return False
-        if node is None:
-            self.select(None)  # the transcript follows the new conversation from its prompt
+        if node is not self.selected:
+            self.select(node)  # the transcript follows the new branch from where it starts
         self.run_turn(node, text)
         return True
 

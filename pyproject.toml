@@ -29,8 +29,8 @@ tui = ["logfire[agent-sandboxes]>=5.5.0", "httpx>=0.28", "textual>=6.0", "watchf
 Repository = "https://github.com/jirikuncar/monty-agent"
 
 [project.scripts]
-monty-agent = "host:main"
-monty-agent-tui = "tui:main"
+monty-agent = "tui:main"
+monty-agent-host = "host:main"
 
 [build-system]
 requires = ["hatchling"]
