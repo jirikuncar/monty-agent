@@ -32,8 +32,9 @@ uv run host.py examples/notes_agent.py "summarize my notes" --workspace ./notes 
   --model gateway/anthropic:claude-haiku-5-5 --remote https://logfire-eu.pydantic.info/
 ```
 
-Create the key in the Logfire UI (Agent Sandboxes > Setup enables sandboxes for the project). It must be a project key:
-the sandbox relay rejects personal keys and OAuth tokens. The Gateway URL is inferred from the key's region.
+Create the key in the Logfire UI (Agent Sandboxes > Setup enables sandboxes for the project). It must be a project key,
+not a personal one; the TUI below uses an OAuth access token instead. The Gateway URL is inferred from the key's
+region.
 Local models work too, e.g. `--model ollama:qwen3.5:latest` with `OLLAMA_BASE_URL=http://localhost:11434/v1`.
 
 ## Child sandboxes
@@ -65,6 +66,60 @@ monty-agent examples/code_agent.py              monty-agent-host
    │     └─ run code ─ print stdout
    └─ chat claude-haiku-5-5 ─ anthropic.messages.create ─ chat claude-haiku-5-5   PAIG
 ```
+
+## General-purpose agent and TUI
+
+`examples/general_agent.py` plans, delegates self-contained subtasks to specialist sub-agents (`coder`, `analyst`,
+`writer`, `critic`; agents of their own in the same sandbox) and solves anything computational in code mode: one Python
+program run with `run_code` in a fresh child sandbox, with the workspace files it names passed in as `files`.
+
+`tui.py` runs it (the default `--script`) against Logfire with nothing stored locally: OAuth device login, every turn in
+Agent Sandboxes, every step a Logfire record. The sidebar lists conversations with their model cost (sum of
+`operation.cost` over each turn's trace); the transcript shows the selected branch, live while it runs, with the code
+each turn ran (`child sandbox` spans) syntax-highlighted. In the command palette (ctrl+p), text that matches no
+command runs as a new prompt, or continues the selection.
+
+Straight from GitHub, nothing to clone (it defaults to `--remote https://logfire-eu.pydantic.info/` and
+`--model gateway/anthropic:claude-haiku-5-5`):
+
+```sh
+uvx --python 3.15 --from 'monty-agent[tui] @ git+https://github.com/jirikuncar/monty-agent' monty-agent-tui
+```
+
+Add `--refresh` to pick up new commits. From a checkout, `--reload` restarts the app on every code change, keeping the
+login:
+
+```sh
+uv run --extra tui tui.py --reload
+```
+
+| Key / command               | Does                                                                                     |
+| --------------------------- | ---------------------------------------------------------------------------------------- |
+| ctrl+o                      | expand every model step: the agent (sub-agents indented), tool results in, reply out     |
+| ctrl+t                      | code runs of every branch of the conversation; enter opens the branch at that run        |
+| click / Enter on an entry   | fork from there: edit a prompt, change an answer, re-run a step or the one before a code run |
+| ctrl+g                      | retry the conversation's last failed request with the same input                         |
+| ctrl+y                      | archive the selected conversation (or unarchive it); the next one is selected            |
+| option-click an entry       | open its span in Logfire (a model step opens its model request); also ctrl+p "Open in Logfire" |
+| ctrl+p "Fork from …"        | the same fork points, searchable                                                         |
+| ctrl+p "Archive …"          | hide a conversation; records are immutable, so this appends an archive event             |
+
+The history comes from the traces: the host's `chat` spans (`gen_ai.system_instructions`, the newest message of
+`gen_ai.input.messages`, `gen_ai.output.messages`), paired in order with the model-step checkpoints of each turn. The
+newest model step stays expanded when nothing but code runs or a failure follows it.
+
+The sidebar lists conversations, newest update first, in two lines: its first prompt and where it stands (✓ done, ? waiting for an answer,
+✗ failed, ◌ mid-turn); then its cost and age (5m, 1h, 2d), with ● when it changed since this
+terminal last showed it. Selecting one shows its newest branch; other branches are in the palette
+(`Branch: …`). Polls read from the newest record
+seen minus two minutes and drop duplicates by node ID; ctrl+r reloads the 14-day window.
+
+Spans follow the OpenTelemetry GenAI conventions the way Claude Code's do, so Logfire's Agents page shows the turns
+of a conversation together: `agent turn` and `agent resume` are `invoke_agent` operations, `child sandbox` and
+`ask user` are `execute_tool` (`run_python`, `ask_user`), and every span of a turn, model requests included, carries
+`gen_ai.conversation.id` and `session.id` as baggage; `gen_ai.agent.name` (the script name) is what makes Logfire list a
+turn as an agent run. In the TUI that ID is the conversation's first node ID; the CLI
+uses one per run. Scrubbing is off (`configure_logfire`): prompts, code and results are the data.
 
 ## Subset
 
@@ -107,6 +162,27 @@ uv run examples/suspend_fork.py
 uv run examples/suspend_fork.py --model gateway/anthropic:claude-haiku-5-5 --fork-model ollama:qwen3.5:latest \
   --remote https://logfire-eu.pydantic.info/
 ```
+
+### Asking the user
+
+`host.ask_user(question)` puts a question to the user. With `Sandbox(ask=...)` (CLI default `--ask stdin`), the host
+answers it in place. With no `ask` and a checkpoint store (`--ask suspend --checkpoints DIR`), the turn stops at the
+question and returns `Suspended(checkpoint, question)`. Any later process can answer it with
+`resume(answer=...)` (`--resume ... --answer ...`); the model request is not re-issued.
+
+```sh
+uv run host.py examples/ask_agent.py "invite the team to a planning meeting" --workspace ./notes \
+  --workspace-mode memory --checkpoints ./steps --ask suspend --model gateway/anthropic:claude-haiku-5-5
+# [host] asked: When should the meeting take place?
+uv run host.py --resume ./steps/0001.monty --answer "Friday 10:00" --workspace ./notes --workspace-mode memory \
+  --checkpoints ./steps-2 --ask suspend --model gateway/anthropic:claude-haiku-5-5
+```
+
+Each answer may lead to another question, so pass a new `--checkpoints` directory on every resume.
+
+Answering never consumes a checkpoint. To change an earlier answer, resume that question's checkpoint again with
+another `--answer`: the turn restarts from there in a fresh session, with the workspace as it was at the question,
+and the later checkpoints stay as they were. The model may ask different follow-up questions on the new branch.
 
 ### Traces
 

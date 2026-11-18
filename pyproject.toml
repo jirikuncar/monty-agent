@@ -11,10 +11,10 @@ classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Software Development :: Interpreters",
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.15"
 dependencies = [
     "logfire>=5.5.0",
     "pydantic-ai-slim[anthropic,openai]>=2.66.0",
@@ -23,9 +23,23 @@ dependencies = [
 
 [project.optional-dependencies]
 remote = ["logfire[agent-sandboxes]>=5.5.0"]
+tui = ["logfire[agent-sandboxes]>=5.5.0", "httpx>=0.28", "textual>=6.0", "watchfiles>=1.0"]
 
 [project.urls]
 Repository = "https://github.com/jirikuncar/monty-agent"
+
+[project.scripts]
+monty-agent = "host:main"
+monty-agent-tui = "tui:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Flat modules; `sandbox/` and `examples/` ship next to them, where `host.SANDBOX_DIR` and the TUI's default
+# `--script` look for them.
+[tool.hatch.build.targets.wheel]
+only-include = ["host.py", "oauth.py", "trace_store.py", "tui.py", "sandbox", "examples"]
 
 [dependency-groups]
 dev = [

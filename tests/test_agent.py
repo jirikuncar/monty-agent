@@ -1,17 +1,21 @@
+import json
 from pathlib import Path
 
+import logfire
 import pytest
+from logfire.testing import CaptureLogfire
 from pydantic_ai import Agent as PydanticAgent
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_monty import MontyRuntimeError
 
-from host import Sandbox, State, StateStore, Suspended, run, run_once
+from host import AgentSession, Sandbox, State, StateStore, Suspended, conversation, run, run_once
 
 EXAMPLES = Path(__file__).parents[1] / 'examples'
 NOTES_AGENT = EXAMPLES / 'notes_agent.py'
 LOG_AGENT = Path(__file__).parent / 'agents' / 'log_agent.py'
 CODE_AGENT = EXAMPLES / 'code_agent.py'
+ASK_AGENT = EXAMPLES / 'ask_agent.py'
 
 pytestmark = pytest.mark.anyio
 
@@ -123,6 +127,34 @@ def test_child_sandbox_runs_code_isolated(tmp_path: Path):
     assert ok == {'output': '45', 'stdout': 'hi\n'}
 
 
+def test_spans_follow_genai_conversation_conventions(capfire: CaptureLogfire):
+    """Like Claude Code's: the turn is `invoke_agent`, host functions are `execute_tool`, and every span of the
+    conversation, model requests included, carries its `gen_ai.conversation.id`."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if not any(p.part_kind == 'tool-return' for m in messages for p in m.parts):
+            return ModelResponse(parts=[ToolCallPart('run_python', {'code': '1 + 1'})])
+        return ModelResponse(parts=[ToolCallPart('final_result', {'answer': '2', 'code': '1 + 1'})])
+
+    logfire.instrument_pydantic_ai()
+    try:
+        with conversation('c0ffee'):
+            run(CODE_AGENT, prompt='go', model=FunctionModel(respond))
+    finally:
+        PydanticAgent.instrument_all(False)
+    spans = {s['name']: s['attributes'] for s in capfire.exporter.exported_spans_as_dict()}
+    assert spans['agent turn {prompt}']['gen_ai.operation.name'] == 'invoke_agent'
+    assert spans['agent turn {prompt}']['gen_ai.agent.name'] == 'code_agent'  # what makes it an agent run
+    turn = {k: json.loads(v) for k, v in spans['agent turn {prompt}'].items() if k.endswith('.messages')}
+    assert turn['gen_ai.input.messages'] == [{'role': 'user', 'parts': [{'type': 'text', 'content': 'go'}]}]
+    [reply] = turn['gen_ai.output.messages']  # Logfire shows a run's transcript from these two
+    assert reply['role'] == 'assistant' and json.loads(reply['parts'][0]['content'])['answer'] == '2'
+    assert spans['child sandbox']['gen_ai.operation.name'] == 'execute_tool'
+    assert spans['child sandbox']['gen_ai.tool.name'] == 'run_python'
+    assert any(name.startswith('chat ') for name in spans)
+    assert {a.get('gen_ai.conversation.id') for a in spans.values()} == {'c0ffee'}
+
+
 async def checkpointed_run(tmp_path: Path, mode: str, workspace: Path) -> StateStore:
     store = StateStore(tmp_path / f'checkpoints-{mode}')
     sandbox = Sandbox(model=appender('step'), workspace=workspace, workspace_mode=mode)
@@ -206,6 +238,52 @@ async def test_idle_state_rollback_between_turns(tmp_path: Path, workspace: Path
         assert session.files()['/workspace/log.txt'] == 't1\nt1\n'
 
 
+def asker() -> FunctionModel:
+    """Ask once when the prompt lacks a time, then save the invitation with the answer."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        parts = [p for m in messages for p in m.parts]
+        answers = [p.content for p in parts if p.part_kind == 'tool-return' and p.tool_name == 'ask_user']
+        saved = [p.content for p in parts if p.part_kind == 'tool-return' and p.tool_name == 'write_note']
+        if not answers:
+            return ModelResponse(parts=[ToolCallPart('ask_user', {'question': 'When?'})])
+        if not saved:
+            return ModelResponse(parts=[ToolCallPart('write_note', {'name': 'invite.md', 'text': answers[0]})])
+        return ModelResponse(parts=[ToolCallPart('final_result', {'path': saved[0], 'text': answers[0]})])
+
+    return FunctionModel(respond)
+
+
+async def test_ask_user_answered_by_host(workspace: Path):
+    questions = []
+
+    def ask(question: str) -> str:
+        questions.append(question)
+        return 'Friday 10:00'
+
+    sandbox = Sandbox(model=asker(), workspace=workspace, workspace_mode='memory', ask=ask)
+    output = await run_once(sandbox, ASK_AGENT, 'invite the team')
+    assert questions == ['When?']
+    assert output.attributes == {'path': '/workspace/invite.md', 'text': 'Friday 10:00'}
+
+
+async def test_ask_user_suspends_then_resumes_with_answer(tmp_path: Path, workspace: Path):
+    store = StateStore(tmp_path / 'steps')
+    sandbox = Sandbox(model=asker(), workspace=workspace, workspace_mode='memory')
+    async with sandbox.session() as session:
+        await session.start(ASK_AGENT)
+        suspended = await session.send('invite the team', store)
+    assert suspended == Suspended(store.paths()[-1], 'When?')
+
+    # The checkpoint survives being answered: answering it again changes the answer in a fresh fork.
+    for answer in ['Friday 10:00', 'Monday 15:00']:
+        async with sandbox.session() as session:
+            await session.restore(store.load(suspended.checkpoint))
+            output = await session.resume(answer=answer)
+            assert output.attributes == {'path': '/workspace/invite.md', 'text': answer}
+            assert session.files() == {'/workspace/todo.txt': 'buy milk', '/workspace/invite.md': answer}
+
+
 def test_tampered_state_is_rejected(tmp_path: Path):
     store = StateStore(tmp_path, key=b'secret')
     path = store.save(State(b'MONTY\0dump', {'/workspace/a': 'x'}))
@@ -213,3 +291,48 @@ def test_tampered_state_is_rejected(tmp_path: Path):
     path.write_bytes(b'MONTY\0evil')
     with pytest.raises(ValueError, match='HMAC'):
         store.load(path)
+
+
+GENERAL_AGENT = EXAMPLES / 'general_agent.py'
+
+
+def test_general_agent_delegates_and_runs_code(workspace: Path):
+    """The orchestrator delegates to the coder, which counts words in a workspace file in code mode."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        returns = [p.content for m in messages for p in m.parts if p.part_kind == 'tool-return']
+        if 'delegate' in {t.name for t in info.function_tools}:
+            if not returns:
+                return ModelResponse(parts=[ToolCallPart('delegate', {'specialist': 'coder', 'task': 'count words'})])
+            return ModelResponse(parts=[TextPart(f'orchestrator: {returns[0]}')])
+        if not returns:
+            code = "len(files['todo.txt'].split())"
+            return ModelResponse(parts=[ToolCallPart('run_code', {'code': code, 'files': ['todo.txt']})])
+        return ModelResponse(parts=[TextPart(f'coder: {returns[0]["output"]}')])
+
+    output = run(GENERAL_AGENT, prompt='go', model=FunctionModel(respond), workspace=workspace, workspace_mode='memory')
+    assert output == 'orchestrator: coder: 2'
+
+
+def test_general_agent_code_mode_without_files():
+    """`files` is optional: models often leave it out (a staging trace failed with a TypeError before)."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        returns = [p.content for m in messages for p in m.parts if p.part_kind == 'tool-return']
+        if not returns:
+            return ModelResponse(parts=[ToolCallPart('run_code', {'code': 'sum(range(10))'})])
+        return ModelResponse(parts=[TextPart(str(returns[0]))])
+
+    output = run(GENERAL_AGENT, prompt='go', model=FunctionModel(respond))
+    assert output == "{'output': '45', 'stdout': ''}"
+
+
+def test_sandbox_pool_uses_the_current_key(monkeypatch: pytest.MonkeyPatch):
+    """A refreshed token reaches new pools: `logfire.agent_sandboxes()` would otherwise use the startup key."""
+    calls: list[dict] = []
+    monkeypatch.setattr(logfire, 'agent_sandboxes', lambda **kwargs: calls.append(kwargs))
+    session = AgentSession(Sandbox(remote='https://logfire.example'))
+    for token in ('first', 'refreshed'):
+        monkeypatch.setenv('LOGFIRE_API_KEY', token)
+        session._pool()
+    assert [c['api_key'] for c in calls] == ['first', 'refreshed']
