@@ -13,6 +13,8 @@ from rich.console import Console
 
 pytest.importorskip('textual')
 
+from textual._xterm_parser import XTermParser
+
 import tui  # after the skip, so a run without the `tui` extra skips these tests
 from oauth import Login
 
@@ -46,6 +48,9 @@ class FakeLogfire:
         self.executions: list[dict] = []
         self.archive_events: list[dict] = []
         self.calls: list[tuple[str, datetime | None]] = []
+        self.variables: dict[tuple[str, str], Any] | None = {}
+        """Managed variables by (name, label); None when the token lacks their scopes."""
+        self.user: str | None = 'ada@example.com'
 
     async def __call__(self, sql: str, params: dict, since: datetime | None = None) -> list[dict]:
         kind = 'cost' if 'per_service' in sql else 'code' if 'child sandbox' in sql else 'other'
@@ -56,6 +61,19 @@ class FakeLogfire:
             return [{'trace_id': t, 'cost': c} for t, c in self.costs.items() if 'IN (' not in sql or t in sql]
         rows = {'code': self.executions, 'requests': [], 'archive': self.archive_events, 'nodes': self.nodes}[kind]
         return [r for r in rows if since is None or datetime.fromisoformat(r['start_timestamp']) >= since]
+
+    async def whoami(self) -> str | None:
+        return self.user
+
+    async def read_variable(self, name: str, label: str) -> Any:
+        if self.variables is None:
+            raise tui.NotGranted('log in again to grant project:read_variables')
+        return self.variables.get((name, label))
+
+    async def write_variable(self, name: str, label: str, value: Any, description: str) -> None:
+        if self.variables is None:
+            raise tui.NotGranted('log in again to grant project:write_variables')
+        self.variables[name, label] = value
 
     def set_token(self, token: str) -> None:
         pass
@@ -99,7 +117,7 @@ async def test_collapsed_conversation_shows_its_last_message(monkeypatch: pytest
         assert app.selected.id == 'e2'
         shown = [w.item.id for w in app.query(tui.Entry)]
         assert shown == ['p1', 'm1', 'm2', 'o1', 'p2', 'e2']
-        assert app.query_one('#prompt').border_title == 'Fibonacci 30?'
+        assert app.query_one('#prompt').border_title == ' Fibonacci 30? '
 
 
 async def test_poll_reads_from_cursor_and_deduplicates(monkeypatch: pytest.MonkeyPatch):
@@ -138,7 +156,7 @@ async def test_fork_from_any_point_and_retry(monkeypatch: pytest.MonkeyPatch):
         assert app.fork_point(code_run).target.id == 'm1'  # the step before the request that ran it
 
         app.pick(nodes['p2'], None)
-        app.query_one('#composer', tui.Input).value = 'and 32?'
+        app.query_one('#composer', tui.Composer).value = 'and 32?'
         await pilot.press('enter')
         await pilot.press('ctrl+g')  # retry the failure: the same follow-up again
         await pilot.pause(0.2)
@@ -200,7 +218,7 @@ def text(renderable: Any) -> str:
     return console.export_text()
 
 
-async def test_sidebar_unfolds_the_open_conversation_into_branches(monkeypatch: pytest.MonkeyPatch):
+async def test_branches_panel_lists_the_open_conversations_branches(monkeypatch: pytest.MonkeyPatch):
     fork = [
         row('d' * 32, '10:10:00', 'f1', 'm1', 'fork', 'gateway/anthropic:m-b', model='m-b'),
         row('d' * 32, '10:10:04', 'k1', 'f1', 'question', 'Show the code?'),
@@ -208,28 +226,27 @@ async def test_sidebar_unfolds_the_open_conversation_into_branches(monkeypatch: 
     app, _ = make_app(monkeypatch, FakeLogfire(CONVERSATION + fork + OTHER), conversation='p1')
     async with app.run_test() as pilot:
         await pilot.pause(0.3)
-        panel = app.query_one('#conversations', tui.OptionList)
-        rows = lambda: [panel.get_option_at_index(i).id for i in range(panel.option_count)]
-        on = lambda: panel.get_option_at_index(panel.highlighted).id
-        assert rows() == ['p1', '>m2', '>f1', 'q1']
-        assert on() == '>f1'
-        assert '$0 · ⑂2' in text(panel.get_option_at_index(0).prompt)
-        assert text(panel.get_option_at_index(2).prompt).startswith('└ ⑂ re-run m-b')
+        conversations = app.query_one('#conversations', tui.OptionList)
+        branches = app.query_one('#branches', tui.OptionList)
+        ids = lambda panel: [panel.get_option_at_index(i).id for i in range(panel.option_count)]
+        on = lambda: branches.get_option_at_index(branches.highlighted).id
+        assert ids(conversations) == ['p1', 'q1']  # one row per conversation
+        assert '$0 · ⑂2' in text(conversations.get_option_at_index(0).prompt)
+        assert branches.has_class('shown') and ids(branches) == ['m2', 'f1'] and on() == 'f1'
+        assert text(branches.get_option_at_index(1).prompt).startswith('└ ⑂ re-run m-b')
 
         app.action_focus_tree()
         await pilot.press('left')  # the sibling branch, at its newest node
-        assert (app.selected.id, on()) == ('e2', '>m2')
+        assert (app.selected.id, on()) == ('e2', 'm2')
         await pilot.press('left')
         assert app.selected.id == 'k1'
+        branches.focus()
         await pilot.press('up')  # moving onto a branch row opens that branch
         await pilot.pause(0.2)
-        assert (app.selected.id, on()) == ('e2', '>m2')
-        await pilot.press('up')  # the conversation row: the branch on screen stays
-        await pilot.pause(0.2)
-        assert (app.selected.id, on()) == ('e2', 'p1')
+        assert (app.selected.id, on()) == ('e2', 'm2')
 
-        app.select(app.nodes['q1'])  # another conversation folds this one up
-        assert rows() == ['p1', 'q1']
+        app.select(app.nodes['q1'])  # a conversation without branches hides the panel
+        assert not branches.has_class('shown') and ids(branches) == []
 
 
 async def test_sidebar_marks_conversations_updated_since_viewed(monkeypatch: pytest.MonkeyPatch):
@@ -355,6 +372,13 @@ async def test_option_click_opens_the_span(monkeypatch: pytest.MonkeyPatch):
         assert opened == [tui.span_url('https://logfire.example/org/proj', T1, 'span-o1', entry.item.at)]
         assert app.fork is None and not launched  # not a pick
 
+        # The times are terminal hyperlinks to the same spans: cmd-click opens them without the app.
+        url = tui.span_url('https://logfire.example/org/proj', T1, 'span-o1', entry.item.at)
+        assert url in entry.border_subtitle and '10:00:09' in entry.border_subtitle
+        marker = next(w for w in app.query(tui.Entry) if w.item.id == 'm1')  # a one-line model step
+        step = tui.span_url('https://logfire.example/org/proj', T1, 'span-m1', marker.item.at)
+        assert step in marker.render().markup
+
 
 async def _async(value: Any) -> Any:
     return value
@@ -373,7 +397,176 @@ async def test_turn_from_a_picked_step_follows_the_new_branch(monkeypatch: pytes
         assert [w.item.id for w in app.query(tui.Entry)] == ['p1', 'm1']
 
         await pilot.press('ctrl+n')
-        app.query_one('#composer', tui.Input).value = 'fresh start'
+        app.query_one('#composer', tui.Composer).value = 'fresh start'
         await pilot.press('enter')
         await pilot.pause(0.2)
         assert launched[-1] == (None, 'fresh start') and app.selected is None
+
+
+async def test_prompt_title_takes_at_most_half_the_width(monkeypatch: pytest.MonkeyPatch):
+    long = [row(T1, '10:00:00', 'p1', None, 'prompt', 'Show how to numerically solve ' * 6)]
+    app, _ = make_app(monkeypatch, FakeLogfire(long), conversation='p1')
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause(0.3)
+        title = app.query_one('#prompt').border_title
+        assert title.startswith(' Show how') and title.endswith('… ') and len(title) <= 40
+
+
+async def test_drag_resizes_the_sidebar_and_its_panels(monkeypatch: pytest.MonkeyPatch):
+    app, launched = make_app(monkeypatch, FakeLogfire(CONVERSATION + OTHER), conversation='p1')
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.3)
+        sidebar = app.query_one('#sidebar', tui.Sidebar)
+        await pilot.mouse_down(sidebar, offset=(sidebar.region.width - 1, 5))  # the │ edge
+        assert sidebar.has_class('resizing')
+        await pilot.hover(sidebar, offset=(50, 5))
+        await pilot.mouse_up(sidebar, offset=(50, 5))
+        await pilot.pause()
+        assert sidebar.region.width == 51 and not sidebar.has_class('resizing')
+        await pilot.mouse_down(sidebar, offset=(sidebar.region.width - 1, 5))
+        await pilot.hover(sidebar, offset=(100, 5))  # at most half the screen
+        await pilot.mouse_up(sidebar, offset=(100, 5))
+        await pilot.pause()
+        assert sidebar.region.width == 60
+
+        await pilot.press('ctrl+t')
+        runs = app.query_one('#code-runs', tui.SidePanel)
+        await pilot.pause()
+        top = runs.region.y
+        await pilot.mouse_down(runs, offset=(5, 0))  # its top line
+        await pilot.hover(None, offset=(5, top - 2))  # screen coordinates: the panel moves while dragged
+        await pilot.mouse_up(None, offset=(5, top - 2))
+        await pilot.pause()
+        assert runs.region.y == top - 2 and runs.styles.height.value == runs.region.height
+        assert app.fork is None and not launched  # dragging picked nothing
+
+
+async def test_composer_takes_several_lines(monkeypatch: pytest.MonkeyPatch):
+    app, launched = make_app(monkeypatch, FakeLogfire(CONVERSATION), conversation='p1')
+    async with app.run_test() as pilot:
+        await pilot.pause(0.3)
+        composer = app.query_one('#composer', tui.Composer)
+        composer.focus()
+        composer.value = ''
+        await pilot.press(*'one', 'alt+enter', *'two', '\\', 'enter', *'three')
+        assert [e.key for e in XTermParser().feed('\x1b\r')] == ['ctrl+j']  # option+Enter in iTerm2, tmux
+        app.post_message(tui.events.Paste('\nfour\nfive'))  # as a terminal paste arrives
+        await pilot.pause()
+        assert composer.text == 'one\ntwo\nthree\nfour\nfive'
+        await pilot.press('enter')
+        await pilot.pause(0.2)
+        assert launched[-1][1] == 'one\ntwo\nthree\nfour\nfive' and composer.text == ''
+
+
+async def drag_sidebar(pilot: Any, app: tui.MontyTui, to: int) -> None:
+    sidebar = app.query_one('#sidebar', tui.Sidebar)
+    await pilot.mouse_down(sidebar, offset=(sidebar.region.width - 1, 5))
+    await pilot.hover(None, offset=(to, 6))
+    await pilot.mouse_up(None, offset=(to, 6))
+    await pilot.pause(0.2)
+
+
+async def test_layout_is_a_managed_variable(monkeypatch: pytest.MonkeyPatch):
+    logfire = FakeLogfire(CONVERSATION)
+    ada, bob = (tui.SETTINGS, 'user:ada@example.com'), (tui.SETTINGS, 'user:bob@example.com')
+    # Merged over the defaults: keys it lacks keep them, ones the TUI no longer has are dropped.
+    logfire.variables = {ada: {'code-runs': 12, 'gone': 3}, bob: {'sidebar': 70}}
+    app, _ = make_app(monkeypatch, logfire, conversation='p1')
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.3)
+        assert app.query_one('#sidebar').region.width == 40
+        assert app.query_one('#code-runs').styles.height.value == 12
+        await drag_sidebar(pilot, app, 29)
+        assert logfire.variables[ada] == {'sidebar': 30, 'branches': None, 'code-runs': 12}
+        assert logfire.variables[bob] == {'sidebar': 70}  # another user's label is untouched
+
+
+async def test_layout_of_a_service_token_is_kept_for_the_session(monkeypatch: pytest.MonkeyPatch):
+    logfire = FakeLogfire(CONVERSATION)
+    logfire.user = None
+    app, _ = make_app(monkeypatch, logfire, conversation='p1')
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.3)
+        await drag_sidebar(pilot, app, 29)
+        assert app.query_one('#sidebar').region.width == 30 and logfire.variables == {}
+
+
+async def test_layout_without_the_variables_scopes(monkeypatch: pytest.MonkeyPatch):
+    logfire = FakeLogfire(CONVERSATION)
+    logfire.variables = None
+    app, _ = make_app(monkeypatch, logfire, conversation='p1')
+    lines: list[str] = []
+    monkeypatch.setattr(app, 'log_line', lines.append)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.3)
+        await drag_sidebar(pilot, app, 44)
+        await drag_sidebar(pilot, app, 50)
+        assert app.query_one('#sidebar').region.width == 51  # dragging still works, for this session
+        assert [line for line in lines if 'layout' in line] == [
+            'layout kept for this session only: log in again to grant project:read_variables'
+        ]
+
+
+class FakeMcp(tui.McpQuery):
+    def __init__(self, tools: set[str], variables: dict[str, Any]):
+        super().__init__('https://logfire.example', 'token')
+        self.headers['mcp-session-id'] = 's'
+        self.listed, self.variables, self.sent = tools, variables, []
+
+    async def _rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == 'tools/list':
+            return {'tools': [{'name': name} for name in self.listed]}
+        name, args = params['name'], params['arguments']
+        self.sent.append((name, args.get('action')))
+        if name == 'token_info':
+            return {'content': [{'text': json.dumps({'user_email': 'ada@example.com', 'user_name': 'ada'})}]}
+        if name == 'variable_get':
+            if args['name'] not in self.variables:
+                return {'content': [{'text': "Variable 'x' not found"}], 'isError': True}
+            labels = {k: {'serialized_value': json.dumps(v)} for k, v in self.variables[args['name']].items()}
+            return {'content': [{'text': json.dumps({'definition': {'labels': labels}})}]}
+        if args['action'] == 'create':
+            self.variables[args['name']] = {}
+        elif args['name'] not in self.variables:
+            return {'content': [{'text': "Variable 'x' not found"}], 'isError': True}
+        else:
+            for label in args['version']['labels']:
+                self.variables[args['name']][label] = args['version']['value']
+        return {'content': [{'text': '{}'}]}
+
+
+async def test_mcp_variables():
+    mcp = FakeMcp({'token_info', 'variable_get', 'variable_manage'}, {})
+    assert await mcp.whoami() == 'ada@example.com'
+    assert await mcp.read_variable('layout', 'user:ada') is None
+    await mcp.write_variable('layout', 'user:ada', {'sidebar': 30}, 'the layout')
+    await mcp.write_variable('layout', 'user:bob', {'sidebar': 50}, 'the layout')
+    assert await mcp.read_variable('layout', 'user:ada') == {'sidebar': 30}
+    assert await mcp.read_variable('layout', 'user:eve') is None
+    actions = [action for _, action in mcp.sent[2:6]]
+    assert actions == ['create_version', 'create', 'create_version', 'create_version']
+
+    readonly = FakeMcp({'variable_get'}, {'layout': {'user:ada': {'sidebar': 30}}})
+    assert await readonly.read_variable('layout', 'user:ada') == {'sidebar': 30}
+    with pytest.raises(tui.NotGranted, match='project:write_variables'):
+        await readonly.write_variable('layout', 'user:ada', {}, 'the layout')
+    with pytest.raises(tui.NotGranted, match='project:read_variables'):
+        await FakeMcp(set(), {}).read_variable('layout', 'user:ada')
+
+
+async def test_entries_name_who_sent_them(monkeypatch: pytest.MonkeyPatch):
+    nodes = [
+        row(T1, '10:00:00', 'p1', None, 'prompt', 'Fibonacci 30?', user='ada@example.com'),
+        row(T1, '10:00:05', 'q1', 'p1', 'question', 'Which index?'),
+        row(T1, '10:00:09', 'a1', 'q1', 'answer', '30', user='bob@example.com'),
+        row(T1, '10:00:12', 'f1', 'a1', 'fork', 'm-b', user='bob@example.com'),
+        row(T1, '10:00:15', 'p2', 'f1', 'prompt', 'and 31?'),  # recorded before senders were
+    ]
+    app, _ = make_app(monkeypatch, FakeLogfire(nodes), conversation='p1')
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.3)
+        assert app.user == 'ada@example.com'
+        titles = {w.item.id: w.border_title or str(w.render()) for w in app.query(tui.Entry)}
+        assert titles['p1'].endswith(' You') and titles['p2'].endswith(' Prompt')
+        assert titles['a1'].endswith(' bob@example.com answered')
+        assert 'Re-run with m-b · bob@example.com' in titles['f1']

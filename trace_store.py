@@ -305,6 +305,10 @@ def iso(at: datetime | str) -> str:
     return moment.astimezone(UTC).isoformat(' ', 'microseconds')
 
 
+class NotGranted(Exception):
+    """The token lacks the scope the MCP tool needs, so the server does not list the tool."""
+
+
 class McpQuery:
     """Run SQL through the Logfire MCP server's `query_run`: the query API takes read tokens, MCP takes OAuth."""
 
@@ -318,11 +322,14 @@ class McpQuery:
         self.days = days
         self._http = httpx.AsyncClient(timeout=60)
         self._ids = 0
+        self._tools: set[str] | None = None
+        """Tools the token's scopes allow, as the server lists them."""
 
     def set_token(self, access_token: str) -> None:
         """Use a refreshed token; the MCP session belongs to the old one, so the next call starts another."""
         self.headers['Authorization'] = f'Bearer {access_token}'
         self.headers.pop('mcp-session-id', None)
+        self._tools = None  # a new login may grant more
 
     async def __call__(self, sql: str, params: dict[str, str], since: datetime | None = None) -> list[dict[str, Any]]:
         if 'mcp-session-id' not in self.headers:
@@ -347,6 +354,50 @@ class McpQuery:
             raise RuntimeError(f'project_logfire_ui_link failed: {text[:500]}')
         url = next(word for word in text.replace('"', ' ').split() if word.startswith('http'))
         return url.split('?')[0].rstrip('/')
+
+    async def whoami(self) -> str | None:
+        """The token's user, by email; None for a service token."""
+        text, error = await self._tool('token_info', {}, scope='project:read')
+        if error:
+            raise RuntimeError(f'token_info failed: {text[:500]}')
+        info = json.loads(text)
+        return info.get('user_email') or info.get('user_name')
+
+    async def read_variable(self, name: str, label: str) -> Any:
+        """The value under the managed variable's label; None when the variable or the label does not exist yet."""
+        text, error = await self._tool('variable_get', {'name': name}, scope='project:read_variables')
+        if error:
+            if 'not found' in text.lower():
+                return None
+            raise RuntimeError(f'variable_get failed: {text[:500]}')
+        held = json.loads(text)['definition'].get('labels', {}).get(label) or {}
+        return parsed(held.get('serialized_value'), None)
+
+    async def write_variable(self, name: str, label: str, value: Any, description: str) -> None:
+        """A new version of the managed variable, under the label (which moves off its old version); the first write
+        creates the variable."""
+        scope = 'project:write_variables'
+        version = {'name': name, 'action': 'create_version', 'version': {'value': value, 'labels': [label]}}
+        text, error = await self._tool('variable_manage', version, scope=scope)
+        if error and 'not found' in text.lower():
+            metadata = {'description': description, 'json_schema': {'type': 'object'}}
+            text, error = await self._tool(
+                'variable_manage', {'name': name, 'action': 'create', 'metadata': metadata}, scope=scope
+            )
+            if not error:
+                text, error = await self._tool('variable_manage', version, scope=scope)
+        if error:
+            raise RuntimeError(f'variable_manage failed: {text[:500]}')
+
+    async def _tool(self, name: str, arguments: dict[str, Any], *, scope: str) -> tuple[str, bool]:
+        if 'mcp-session-id' not in self.headers:
+            await self._initialize()
+        if self._tools is None:
+            self._tools = {tool['name'] for tool in (await self._rpc('tools/list', {}))['tools']}
+        if name not in self._tools:
+            raise NotGranted(f'log in again to grant {scope}')
+        result = await self._rpc('tools/call', {'name': name, 'arguments': arguments})
+        return result['content'][0]['text'], bool(result.get('isError'))
 
     async def aclose(self) -> None:
         await self._http.aclose()

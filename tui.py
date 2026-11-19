@@ -31,32 +31,39 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 from urllib.parse import urlencode
 from uuid import uuid4
 
 import logfire
 import requests
 from pydantic_core import to_jsonable_python
+from rich.style import Style
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
-from textual import events, on, work
+from textual import _ansi_sequences, events, on, work
 from textual.app import App, ComposeResult, SystemCommand
-from textual.binding import Binding
+from textual.binding import Binding, BindingType
 from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.content import Content
+from textual.keys import Keys
+from textual.message import Message
 from textual.screen import Screen
 from textual.widget import Widget
-from textual.widgets import Footer, Header, Input, Markdown, OptionList, RichLog, Static
+from textual.widgets import Footer, Header, Markdown, OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
 
 from host import Sandbox, Suspended, configure_logfire, conversation, sandbox_key
 from oauth import Login, login, refresh
-from trace_store import Execution, McpQuery, Node, Request, TraceStore, iso, parsed
+from trace_store import Execution, McpQuery, Node, NotGranted, Request, TraceStore, iso, parsed
 
 HERE = Path(__file__).parent
+SETTINGS = 'monty_agent_tui'
+"""The managed variable holding the layout, one label per user (`user:<email>`), so users of a project don't collide."""
+LAYOUT: dict[str, int | None] = {'sidebar': 40, 'branches': None, 'code-runs': None}
+"""Sidebar width and side-panel heights, in cells; None leaves the stylesheet's size. Saved layouts merge over it."""
 RELOAD = 'reload'
 MODULES = ('oauth', 'host', 'trace_store', 'tui')
 """Reloaded in dependency order."""
@@ -107,6 +114,11 @@ NEXT = {
 }
 
 
+def stamp(at: str, url: str | None) -> Text:
+    """The entry's time, as a terminal hyperlink to its span when there is one (cmd-click opens it)."""
+    return Text(at[11:19], style=Style(link=url) if url else '')
+
+
 def span_url(project_url: str, trace: str, span: str | None, at: str) -> str:
     """Logfire's live view filtered to the span (or its trace), around the time it started."""
     moment = datetime.fromisoformat(at)
@@ -144,6 +156,111 @@ Item = Node | Execution
 """Anything in the transcript; each one can be forked from (`MontyTui.fork_point`)."""
 
 
+class Resizable:
+    """Mixin, after the widget class (Textual takes CSS from the first base): drag one border to resize: `right` sets the width, `top` the height. No keys: they would collide with the
+    system's (ctrl+arrows switch macOS Spaces, option/cmd+arrows move the input cursor)."""
+
+    edge: ClassVar[Literal['right', 'top']]
+    sizes: ClassVar[tuple[int, int]] = (3, 1000)
+    """Smallest and largest size, in cells; the largest is cut to half the screen too."""
+    _dragging = False
+
+    def on_edge(self, event: events.MouseEvent) -> bool:
+        region = self.region
+        return event.screen_x == region.right - 1 if self.edge == 'right' else event.screen_y == region.y
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        if self.on_edge(event):
+            self._dragging = True
+            self.add_class('resizing')
+            self.capture_mouse()
+            event.stop()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if not self._dragging:
+            return
+        region, screen = self.region, self.screen.size
+        if self.edge == 'right':
+            low, high = self.sizes[0], min(self.sizes[1], screen.width // 2)
+            self.styles.width = max(low, min(high, event.screen_x - region.x + 1))
+        else:
+            low, high = self.sizes[0], min(self.sizes[1], screen.height // 2)
+            self.styles.height = max(low, min(high, region.bottom - event.screen_y))
+            self.styles.max_height = None
+        event.stop()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self._dragging:
+            self._dragging = False
+            self.remove_class('resizing')
+            self.release_mouse()
+            event.stop()
+            self.post_message(Resized())
+
+
+class Resized(Message):
+    """A drag resized the sidebar or a panel: time to save the layout."""
+
+
+class Sidebar(Vertical, Resizable):
+    edge = 'right'
+    sizes = (24, 200)
+
+
+class SidePanel(OptionList, Resizable):
+    """A list under the conversations (branches, code runs); drag its top line to resize it."""
+
+    edge = 'top'
+
+
+# Option+Enter in iTerm2 and tmux is ESC CR, which Textual reads as a plain Enter: make it the new-line key.
+_ansi_sequences.ANSI_SEQUENCES_KEYS['\x1b\r'] = (Keys.ControlJ,)
+
+
+class Composer(TextArea):
+    """The prompt: Enter sends it; option/shift+Enter, ctrl+j or a trailing backslash start a new line, and pastes
+    keep theirs."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [  # ctrl+y is Archive
+        Binding('super+y', 'redo', show=False) if b.key == 'ctrl+y,super+y' else b
+        for b in TextArea.BINDINGS
+        if isinstance(b, Binding)
+    ]
+
+    @dataclass
+    class Submitted(Message):
+        input: Composer
+        value: str
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(compact=True, soft_wrap=True, show_line_numbers=False, highlight_cursor_line=False, **kwargs)
+
+    @property
+    def value(self) -> str:
+        return self.text
+
+    @value.setter
+    def value(self, text: str) -> None:
+        self.text = text
+        self.move_cursor(self.document.end)
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key in ('shift+enter', 'alt+enter', 'ctrl+j'):
+            event.stop()
+            event.prevent_default()
+            self.insert('\n')
+        elif event.key == 'enter':
+            event.stop()
+            event.prevent_default()
+            row, column = self.cursor_location
+            if column and self.document.get_line(row)[column - 1] == '\\':
+                self.replace('\n', (row, column - 1), (row, column))
+            else:
+                self.post_message(self.Submitted(self, self.text))
+        else:
+            await super()._on_key(event)
+
+
 class Pickable(Static):
     """A transcript entry: click it, or focus it and press Enter, to fork from there; option-click (or ctrl-click)
     opens its span in Logfire."""
@@ -168,13 +285,24 @@ class Pickable(Static):
 class Entry(Pickable):
     """One node in the transcript; a model step shows the request it was taken before, expanded with ctrl+o."""
 
-    def __init__(self, node: Node, request: Request | None = None, *, sub_agent: bool = False, expanded: bool = False):
+    def __init__(
+        self,
+        node: Node,
+        request: Request | None = None,
+        *,
+        sub_agent: bool = False,
+        expanded: bool = False,
+        link: str | None = None,
+        me: str | None = None,
+    ):
         icon, _ = ICONS[node.kind]
         self.request, self.sub_agent = request, sub_agent
+        sender = node.attrs.get('user')
+        who = 'You' if sender is not None and sender == me else sender
         title = {
-            'prompt': 'You',
-            'answer': 'You answered',
-            'fork': f'Re-run with {node.text}',
+            'prompt': who or 'Prompt',
+            'answer': f'{who} answered' if who else 'Answered',
+            'fork': f'Re-run with {node.text}' + (f' · {who}' if who and who != 'You' else ''),
             'model': f'Model step · {node.attrs.get("messages", "?")} messages',
             'question': 'Agent asks',
             'output': 'Result',
@@ -187,17 +315,17 @@ class Entry(Pickable):
             if expanded:
                 super().__init__(classes='entry model expanded sub' if sub_agent else 'entry model expanded')
                 self.border_title = f'{icon} {title}'
-                self.border_subtitle = node.at[11:19]
+                self.border_subtitle = stamp(node.at, link)
                 self.body = ''
                 return
         if node.kind in ('fork', 'model'):
             # A one-line marker between the bordered messages.
-            super().__init__(f'{icon} {title} · {node.at[11:19]}', classes=f'entry {node.kind}', markup=False)
+            super().__init__(Text.assemble(f'{icon} {title} · ', stamp(node.at, link)), classes=f'entry {node.kind}')
             self.body = ''
             return
         super().__init__(classes=f'entry {node.kind}')
         self.border_title = f'{icon} {title}'
-        self.border_subtitle = node.at[11:19]
+        self.border_subtitle = stamp(node.at, link)
         self.body = node.text
 
     def compose(self) -> ComposeResult:
@@ -212,11 +340,11 @@ class Entry(Pickable):
 class CodeEntry(Pickable):
     """Code the agent ran in a child sandbox, and its result."""
 
-    def __init__(self, execution: Execution):
+    def __init__(self, execution: Execution, link: str | None = None):
         super().__init__(classes='entry code')
         self.item = execution
         self.border_title = '⌘ Ran code'
-        self.border_subtitle = execution.at[11:19]
+        self.border_subtitle = stamp(execution.at, link)
 
     def compose(self) -> ComposeResult:
         yield Static(python(self.item.code), classes='source')
@@ -363,8 +491,17 @@ class MontyTui(App[str | None]):
     COMMANDS = App.COMMANDS | {Prompts}
     CSS = """
     #sidebar { width: 40; border-right: solid $panel-lighten-1; }
+    #sidebar.resizing { border-right: solid $accent; }
+    #sidebar SidePanel.resizing { border-top: solid $accent; }
     #conversations { height: 1fr; background: $background; border: none; border-top: solid $panel-lighten-1; }
-    #conversations > .option-list--option { padding: 0 1 0 0; }
+    /* Sidebar lists: the space around a row is its own padding, so hover and selection fill the whole row. */
+    #sidebar OptionList { padding: 0; }
+    #sidebar OptionList > .option-list--option,
+    #sidebar OptionList > .option-list--option-highlighted,
+    #sidebar OptionList > .option-list--option-hover { padding: 0 1; }
+    #sidebar OptionList > .option-list--option-hover { background: $foreground 10%; }
+    #sidebar OptionList > .option-list--option-highlighted { background: $accent 25%; color: $foreground; }
+    #sidebar OptionList:focus > .option-list--option-highlighted { background: $accent 50%; }
     #transcript { padding: 0 1; }
     .empty { color: $text-muted; padding: 1 2; }
     .entry { border: round $panel; padding: 0 1; margin: 0 0 1 0; height: auto; }
@@ -390,9 +527,14 @@ class MontyTui(App[str | None]):
     #prompt { height: 3; border-top: solid $panel-lighten-1; border-bottom: solid $panel-lighten-1; }
     #prompt { border-title-align: right; border-title-color: $accent; border-title-style: bold; }
     #where { width: auto; padding: 0 1; color: $accent; text-style: bold; }
-    #composer { border: none; height: 1; padding: 0; background: $background; }
+    #composer { border: none; height: auto; max-height: 10; padding: 0; background: $background; }
     #composer:focus { border: none; }
-    #code-runs { height: 1fr; border-top: solid $panel-lighten-1; background: $background; display: none; }
+    #branches {
+        height: auto; max-height: 50%; background: $background; display: none;
+        border: none; border-top: solid $panel-lighten-1;
+    }
+    #branches.shown { display: block; }
+    #code-runs { height: 1fr; background: $background; display: none; border: none; border-top: solid $panel-lighten-1; }
     #code-runs.shown { display: block; }
     #log { height: 8; border-top: solid $panel-lighten-1; display: none; }
     #log.shown { display: block; }
@@ -435,6 +577,12 @@ class MontyTui(App[str | None]):
         self.rows: dict[str, int] = {}
         self.order: list[str] = []
         self.project_url: str | None = None
+        self.settings: dict[str, int | None] = dict(LAYOUT)
+        self.settings_label: str | None = None
+        self.user: str | None = None
+        """Who is logged in (email), recorded on the prompts and answers sent from here."""
+        self.settings_off = False
+        """Without the managed-variables scopes, the layout stays for the session only."""
         self.runs_shown: list[Execution] = []
         self.archived: dict[str, tuple[str, bool]] = {}
         """Root node -> (when, archived), from the newest archive event."""
@@ -448,11 +596,12 @@ class MontyTui(App[str | None]):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal():
-            with Vertical(id='sidebar'):
+            with Sidebar(id='sidebar'):
                 conversations = OptionList(id='conversations')
                 conversations.border_title = 'Conversations'
                 yield conversations
-                yield OptionList(id='code-runs')
+                yield SidePanel(id='branches')
+                yield SidePanel(id='code-runs')
             with Vertical():
                 yield Static(id='cost')
                 yield VerticalScroll(id='transcript')
@@ -460,12 +609,14 @@ class MontyTui(App[str | None]):
         yield Static(id='status')
         with Horizontal(id='prompt'):
             yield Static('❯', id='where')
-            yield Input(id='composer')
+            yield Composer(id='composer')
         yield Footer()
 
     async def on_mount(self) -> None:
         self.use(self.login)
         self.keep_fresh()
+        self.learn_project_url()
+        self.load_settings()
         if self.args.reload:
             self.watch_code()
         self.set_interval(0.1, self.show_status)
@@ -583,7 +734,7 @@ class MontyTui(App[str | None]):
     def action_new(self) -> None:
         self.query_one('#conversations', OptionList).highlighted = None
         self.select(None)
-        self.query_one('#composer', Input).focus()
+        self.query_one('#composer', Composer).focus()
 
     def action_toggle_log(self) -> None:
         self.query_one('#log').toggle_class('shown')
@@ -755,7 +906,7 @@ class MontyTui(App[str | None]):
         if widget is not None:
             widget.add_class('picked')
             widget.scroll_visible()
-        composer = self.query_one('#composer', Input)
+        composer = self.query_one('#composer', Composer)
         composer.placeholder = f'⑂ {point.verb} · esc cancels'
         composer.value = point.text
         composer.focus()
@@ -772,9 +923,81 @@ class MontyTui(App[str | None]):
             except Exception as error:  # noqa: BLE001 - shown as a toast
                 self.notify(f'No Logfire link: {error}', severity='error')
                 return
-        url = span_url(self.project_url, item.trace, item.span, item.at)
+        url = self.span_link(item)
         self.log_line(f'open {url}')
-        webbrowser.open(url)
+        webbrowser.open(url or self.project_url)
+
+    @work(group='settings-load')  # apart from saving, which cancels an earlier save
+    async def load_settings(self) -> None:
+        """Who is logged in, then their saved layout."""
+        try:
+            self.user = await self.sql.whoami()
+        except Exception as error:  # noqa: BLE001 - messages then go out without a sender
+            self.log_line(f'user unknown: {error}')
+        if self.fork is None:  # re-rendering would drop a pick in progress
+            self.select(self.selected)  # "You" on your own messages
+        try:
+            if self.user is None:
+                raise NotGranted('no user to keep it for')
+            label = f'user:{self.user}'
+            stored = await self.sql.read_variable(SETTINGS, label)
+        except NotGranted as error:
+            self.settings_off = True
+            self.log_line(f'layout kept for this session only: {error}')
+            return
+        except Exception as error:  # noqa: BLE001 - the default layout is fine
+            self.log_line(f'layout not loaded: {error}')
+            return
+        self.settings_label = label
+        saved = stored if isinstance(stored, dict) else {}
+        self.settings = LAYOUT | {k: v for k, v in saved.items() if k in LAYOUT and isinstance(v, int | None)}
+        self.apply_layout(self.settings)
+
+    def layout(self) -> dict[str, int | None]:
+        """The defaults, with the sizes set by dragging."""
+        sizes = {'sidebar': self.query_one('#sidebar').styles.width}
+        sizes |= {panel.id: panel.styles.height for panel in self.query(SidePanel)}
+        dragged = {key: int(size.value) for key, size in sizes.items() if size is not None and size.is_cells}
+        return LAYOUT | {key: size for key, size in dragged.items() if key in LAYOUT}
+
+    def apply_layout(self, sizes: dict[str, int | None]) -> None:
+        for key, size in sizes.items():
+            if size is None:
+                continue
+            if key == 'sidebar':
+                self.query_one('#sidebar').styles.width = max(Sidebar.sizes[0], size)
+            elif panels := list(self.query(f'SidePanel#{key}')):
+                panels[0].styles.height = max(SidePanel.sizes[0], size)
+                panels[0].styles.max_height = None
+
+    @on(Resized)
+    @work(exclusive=True, group='settings')
+    async def save_settings(self) -> None:
+        sizes = self.layout()
+        if self.settings_off or self.settings_label is None or sizes == self.settings:
+            return
+        try:
+            description = 'monty-agent TUI layout (sidebar width, panel heights), a label per user'
+            await self.sql.write_variable(SETTINGS, self.settings_label, sizes, description)
+        except NotGranted as error:
+            self.settings_off = True
+            self.log_line(f'layout kept for this session only: {error}')
+            return
+        except Exception as error:  # noqa: BLE001 - tried again on the next drag
+            self.log_line(f'layout not saved: {error}')
+            return
+        self.settings = sizes
+
+    @work(group='links')
+    async def learn_project_url(self) -> None:
+        """The project's Logfire page, so transcript times link to their spans (cmd-click in iTerm2)."""
+        try:
+            self.project_url = await self.sql.project_url()
+        except Exception as error:  # noqa: BLE001 - option-click asks again; the times stay plain meanwhile
+            self.log_line(f'no Logfire links: {error}')
+            return
+        if self.fork is None:  # re-rendering would drop a pick in progress
+            self.select(self.selected)
 
     def unpick(self) -> None:
         self.fork = None
@@ -783,10 +1006,16 @@ class MontyTui(App[str | None]):
         self.show_where()
 
     def show_where(self) -> None:
-        """The line above the composer names the conversation it continues: its first prompt, shortened."""
-        self.query_one('#composer', Input).placeholder = self.placeholder()
+        """The line above the composer names the conversation it continues: its first prompt, in at most half the
+        screen width."""
+        self.query_one('#composer', Composer).placeholder = self.placeholder()
         root = self.conversation_id()
-        self.query_one('#prompt').border_title = one_line(self.nodes[root].text, 48) if root else 'new conversation'
+        width = max(self.size.width // 2 - 2, 10)
+        title = one_line(self.nodes[root].text, width) if root else 'new conversation'
+        self.query_one('#prompt').border_title = f' {title} '  # ── Title ─
+
+    def on_resize(self) -> None:
+        self.show_where()
 
     def placeholder(self) -> str:
         if self.selected is None:
@@ -927,23 +1156,28 @@ class MontyTui(App[str | None]):
                 self.select(self.nodes[select])
 
     def fill_sidebar(self, panel: OptionList, open_root: str | None, selected: str | None) -> None:
-        branches = self.branch_tree(self.nodes[open_root]) if open_root in self.nodes else []
-        on = self.branch_of(branches, selected)
-        options, self.rows, highlight = [], {}, None
-        for root in self.order:
-            self.rows[root] = len(options)
-            options.append(Option(self.row_label(self.nodes[root], self.subtree(self.nodes[root])), id=root))
-            if root != open_root:
-                continue
-            highlight = len(options) - 1
-            for branch in branches[1:] if len(branches) > 1 else []:
-                if branch is on:
-                    highlight = len(options)
-                options.append(Option(self.branch_label(branch), id=f'>{branch.start.id}'))
+        """One row per conversation; the open one's branches go in the panel below (`fill_branches`)."""
+        self.rows = {root: index for index, root in enumerate(self.order)}
+        options = [Option(self.row_label(self.nodes[r], self.subtree(self.nodes[r])), id=r) for r in self.order]
         scroll = panel.scroll_y
         panel.clear_options()
         panel.add_options(options)
-        panel.highlighted = highlight
+        panel.highlighted = self.rows.get(open_root) if open_root else None
+        panel.scroll_to(y=scroll, animate=False)
+        self.fill_branches(open_root, selected)
+
+    def fill_branches(self, open_root: str | None, selected: str | None) -> None:
+        """The open conversation cut at its branch points, shown when it has more than one branch."""
+        panel = self.query_one('#branches', OptionList)
+        branches = self.branch_tree(self.nodes[open_root]) if open_root in self.nodes else []
+        shown = branches[1:]  # the conversation's own row stands for the trunk
+        panel.set_class(bool(shown), 'shown')
+        on = self.branch_of(branches, selected)
+        scroll = panel.scroll_y
+        panel.clear_options()
+        panel.add_options(Option(self.branch_label(b), id=b.start.id) for b in shown)
+        panel.border_title = f'Branches · {sum(b.leaf for b in branches)} (← →)'
+        panel.highlighted = next((i for i, b in enumerate(shown) if b is on), None)
         panel.scroll_to(y=scroll, animate=False)
 
     def branch_tree(self, root: Node) -> list[Branch]:
@@ -1113,21 +1347,29 @@ class MontyTui(App[str | None]):
     @on(OptionList.OptionSelected, '#conversations')
     def on_conversation_clicked(self, event: OptionList.OptionSelected) -> None:
         """A click (or enter) opens the conversation at its newest message, even one already on screen."""
-        if (start := self.nodes.get((event.option.id or '').removeprefix('>'))) is not None:
+        if (start := self.nodes.get(event.option.id or '')) is not None:
             self.select(max(self.subtree(start), key=lambda n: n.at))
-            self.query_one('#composer', Input).focus()
+            self.query_one('#composer', Composer).focus()
+
+    @on(OptionList.OptionSelected, '#branches')
+    def on_branch_clicked(self, event: OptionList.OptionSelected) -> None:
+        """A click (or enter) opens the branch at its newest message."""
+        self.on_conversation_clicked(event)
+
+    @on(OptionList.OptionHighlighted, '#branches')
+    def on_branch_highlight(self, event: OptionList.OptionHighlighted) -> None:
+        start = self.nodes.get(event.option.id or '')
+        if start is None or event.option_index != event.option_list.highlighted:
+            return
+        if self.selected not in self.subtree(start):  # its newest node, unless the selection is on it already
+            self.select(max(self.subtree(start), key=lambda n: n.at))
 
     @on(OptionList.OptionHighlighted, '#conversations')
     def on_highlight(self, event: OptionList.OptionHighlighted) -> None:
-        option = event.option.id or ''
-        data = self.nodes.get(option.removeprefix('>'))
+        data = self.nodes.get(event.option.id or '')
         # Highlights arrive as messages: one the list has moved on from (a rebuild, a selection made elsewhere) is
         # not a pick.
         if data is None or event.option_index != event.option_list.highlighted:
-            return
-        if option.startswith('>'):  # a branch row: its newest node, unless the selection is on it already
-            if self.selected not in self.subtree(data):
-                self.select(max(self.subtree(data), key=lambda n: n.at))
             return
         # A conversation shows its newest branch through the last message; a branch of it already on screen (one
         # you were following, or switched to) stays.
@@ -1202,12 +1444,20 @@ class MontyTui(App[str | None]):
 
     def entry(self, item: Item) -> Pickable:
         if isinstance(item, Execution):
-            return CodeEntry(item)
+            return CodeEntry(item, self.span_link(item))
         request, sub_agent = self.step_requests.get(item.id, (None, False))
-        return Entry(item, request, sub_agent=sub_agent, expanded=self.expanded or item.id == self.last_step)
+        expanded = self.expanded or item.id == self.last_step
+        link = self.span_link(request or item)
+        return Entry(item, request, sub_agent=sub_agent, expanded=expanded, link=link, me=self.user)
 
-    @on(Input.Submitted)
-    def on_submit(self, event: Input.Submitted) -> None:
+    def span_link(self, item: Item | Request) -> str | None:
+        """Where the item's span is in Logfire: a model step's model request, else its own record."""
+        if self.project_url is None or item.trace is None:
+            return None
+        return span_url(self.project_url, item.trace, item.span, item.at)
+
+    @on(Composer.Submitted)
+    def on_submit(self, event: Composer.Submitted) -> None:
         point = self.fork or (self.fork_point(self.selected) if self.selected else ForkPoint(None, '', ''))
         if point is None:
             self.notify('Nothing to continue from here', severity='warning')
@@ -1250,13 +1500,15 @@ class MontyTui(App[str | None]):
         try:
             # The first node goes in before checkout, so a refused checkout still shows under it.
             if node is None:
-                await store.record('prompt', text, node_id=conversation_id, script=str(self.args.script), model=model)
+                await store.record(
+                    'prompt', text, node_id=conversation_id, script=str(self.args.script), model=model, user=self.user
+                )
             elif node.kind == 'output':
-                await store.record('prompt', text, model=model)
+                await store.record('prompt', text, model=model, user=self.user)
             elif node.kind == 'question':
-                await store.record('answer', text)
+                await store.record('answer', text, user=self.user)
             else:
-                await store.record('fork', model, model=model)
+                await store.record('fork', model, model=model, user=self.user)
             if self.args.files == 'session':
                 pool = logfire.agent_sandboxes(api_key=sandbox_key(), url=self.args.remote, auto_resume=False)
                 store.files_pool = await stack.enter_async_context(pool)

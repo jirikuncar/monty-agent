@@ -25,6 +25,8 @@ SCOPES = (
     'project:write_otlp',
     'project:read',
     'project:read_otlp',
+    'project:read_variables',  # the TUI layout; without these it is kept for the session only
+    'project:write_variables',
 )
 # Gateway URL per Logfire backend; the Gateway accepts the backend's tokens.
 GATEWAYS = {

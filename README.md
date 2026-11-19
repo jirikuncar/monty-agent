@@ -67,12 +67,22 @@ do run again, so make such tools idempotent.
 | Key            | Does                                                                     |
 | -------------- | ------------------------------------------------------------------------ |
 | click / Enter  | fork from that entry: answer, edit a prompt, re-run a step               |
-| ← / →          | in the sidebar: the other branches from the same fork point              |
+| option+Enter   | new line in the prompt (also ctrl+j, or `\` before Enter); pastes keep theirs |
+| drag a border  | resize the sidebar (its right edge) or a side panel (its top line)       |
+| ← / →          | the other branches from the same fork point (Branches panel, sidebar)    |
 | ctrl+t         | code runs of every branch; Enter opens the branch at that run            |
 | ctrl+o         | expand model steps: which agent, tool results in, reply out              |
 | ctrl+g         | retry the last failed request                                            |
 | ctrl+p         | commands, branches; text that matches none runs as a prompt              |
+| cmd-click time | open the span in Logfire: entry times are terminal hyperlinks (OSC 8)     |
 | option-click   | open the span in Logfire                                                 |
+
+The layout is saved in the project's `monty_agent_tui` managed variable, under a label per user (`user:<email>`), and
+merged over the defaults. It needs the `project:read_variables` and `project:write_variables` scopes; a login from
+before they were requested, or a service token, keeps it for the session only.
+
+Inside tmux, option-click reaches the TUI only when tmux binds it (plain clicks are bound, ctrl-click swaps panes): add
+`bind -n M-MouseDown1Pane select-pane -t = \; send-keys -M` to `~/.tmux.conf`.
 
 ## Without the TUI
 
