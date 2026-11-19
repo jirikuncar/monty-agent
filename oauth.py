@@ -43,25 +43,34 @@ class Login:
     client_id: str
     token_endpoint: str
     refresh_token: str | None = None
+    gateway_url: str | None = None
+    """The AI Gateway for a backend not in `GATEWAYS`, e.g. a self-hosted one; None there means no Gateway."""
 
     @property
-    def gateway(self) -> str:
-        return GATEWAYS[self.backend]
+    def gateway(self) -> str | None:
+        return self.gateway_url or GATEWAYS.get(self.backend)
 
     def env(self) -> dict[str, str]:
         """Environment for `logfire.configure`, `logfire.agent_sandboxes` and the `gateway/...` models."""
-        return {
+        env = {
             'LOGFIRE_TOKEN': self.access_token,
             'LOGFIRE_BASE_URL': self.backend,
             'LOGFIRE_API_KEY': self.access_token,
-            'PYDANTIC_AI_GATEWAY_API_KEY': self.access_token,
-            'PYDANTIC_AI_GATEWAY_BASE_URL': f'{self.gateway}/proxy',
         }
+        if self.gateway is not None:
+            env |= {
+                'PYDANTIC_AI_GATEWAY_API_KEY': self.access_token,
+                'PYDANTIC_AI_GATEWAY_BASE_URL': f'{self.gateway}/proxy',
+            }
+        return env
 
 
-async def login(backend: str, show: Callable[[str, str], None], scopes: tuple[str, ...] = SCOPES) -> Login:
+async def login(
+    backend: str, show: Callable[[str, str], None], scopes: tuple[str, ...] = SCOPES, gateway: str | None = None
+) -> Login:
     """`show(url, user_code)` tells the user where to approve; returns once they have."""
     backend = backend.rstrip('/')
+    session = Login(backend, '', 0, '', '', gateway_url=gateway.rstrip('/') if gateway else None)
     scope = ' '.join(scopes)
     async with httpx.AsyncClient(timeout=30.0) as http:
         meta = (await http.get(f'{backend}/.well-known/oauth-authorization-server')).raise_for_status().json()
@@ -75,7 +84,7 @@ async def login(backend: str, show: Callable[[str, str], None], scopes: tuple[st
             },
         )
         client_id = registration.raise_for_status().json()['client_id']
-        client = [('client_id', client_id), *resources(backend)]
+        client = [('client_id', client_id), *resources(session)]
 
         verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b'=').decode()
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
@@ -98,7 +107,9 @@ async def login(backend: str, show: Callable[[str, str], None], scopes: tuple[st
             await asyncio.sleep(interval)
             response = await http.post(meta['token_endpoint'], headers=FORM, content=urlencode(poll))
             if response.status_code == 200:
-                return issued(Login(backend, '', 0, client_id, meta['token_endpoint']), response.json())
+                return issued(
+                    replace(session, client_id=client_id, token_endpoint=meta['token_endpoint']), response.json()
+                )
             body = response.json()
             detail = body.get('detail', body)
             error = detail.get('error') if isinstance(detail, dict) else None
@@ -115,7 +126,7 @@ async def refresh(session: Login) -> Login:
         raise RuntimeError('no refresh token: log in again')
     form = [('grant_type', 'refresh_token'), ('client_id', session.client_id), ('refresh_token', session.refresh_token)]
     # The token endpoint binds the resources to the refresh token; sending them again is harmless and portable.
-    form += resources(session.backend)
+    form += resources(session)
     async with httpx.AsyncClient(timeout=30.0) as http:
         response = await http.post(session.token_endpoint, headers=FORM, content=urlencode(form))
     if response.status_code != 200:
@@ -123,8 +134,9 @@ async def refresh(session: Login) -> Login:
     return issued(session, response.json())
 
 
-def resources(backend: str) -> list[tuple[str, str]]:
-    return [('resource', f'{GATEWAYS[backend]}/proxy'), ('resource', backend)]
+def resources(session: Login) -> list[tuple[str, str]]:
+    gateway = [('resource', f'{session.gateway}/proxy')] if session.gateway else []
+    return [*gateway, ('resource', session.backend)]
 
 
 def issued(session: Login, token: dict[str, Any]) -> Login:

@@ -168,3 +168,15 @@ def test_env_points_every_client_at_the_backend_and_its_gateway():
     assert env['LOGFIRE_BASE_URL'] == 'https://logfire-us.pydantic.dev'
     assert env['PYDANTIC_AI_GATEWAY_BASE_URL'] == 'https://gateway-us.pydantic.dev/proxy'
     assert {env[k] for k in ('LOGFIRE_TOKEN', 'LOGFIRE_API_KEY', 'PYDANTIC_AI_GATEWAY_API_KEY')} == {'tok'}
+
+
+def test_self_hosted_backend_takes_an_explicit_gateway_or_none():
+    custom = Login('https://logfire.example.com', 'tok', 0, 'c', TOKEN_URL, gateway_url='https://gateway.example.com')
+    assert custom.env()['PYDANTIC_AI_GATEWAY_BASE_URL'] == 'https://gateway.example.com/proxy'
+    assert oauth.resources(custom) == [
+        ('resource', 'https://gateway.example.com/proxy'),
+        ('resource', 'https://logfire.example.com'),
+    ]
+    bare = Login('https://logfire.example.com', 'tok', 0, 'c', TOKEN_URL)
+    assert 'PYDANTIC_AI_GATEWAY_BASE_URL' not in bare.env()
+    assert oauth.resources(bare) == [('resource', 'https://logfire.example.com')]

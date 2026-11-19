@@ -534,7 +534,7 @@ class MontyTui(App[str | None]):
             self.notify(f'Approve the login in your browser, code {code}', timeout=60)
 
         try:
-            session = await login(self.args.remote, show)
+            session = await login(self.args.remote, show, gateway=self.args.gateway)
         except Exception as error:  # noqa: BLE001 - shown in the log pane, the old token stays in use
             self.log_line(f'login failed: {error}')
             return
@@ -1203,6 +1203,7 @@ Every step is a checkpoint in Logfire: pick one in the sidebar to answer, contin
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--remote', default='https://logfire-us.pydantic.dev/', help='Logfire backend URL')
+    parser.add_argument('--gateway', help='AI Gateway URL, for a backend without a known one (self-hosted)')
     parser.add_argument('--model', default='gateway/anthropic:claude-haiku-5-5')
     parser.add_argument('--script', type=Path, default=Path(__file__).parent / 'examples' / 'general_agent.py')
     parser.add_argument('--workspace', type=Path, help='seed files for new conversations')
@@ -1228,7 +1229,7 @@ def main() -> None:
     def show(url: str, code: str) -> None:
         print(f'Approve this login in your browser: {url}\nCode: {code}', flush=True)
 
-    session = asyncio.run(login(args.remote, show))
+    session = asyncio.run(login(args.remote, show, gateway=args.gateway))
     os.environ.update(session.env())
     export_with(lambda: os.environ['LOGFIRE_TOKEN'])
     configure_logfire()

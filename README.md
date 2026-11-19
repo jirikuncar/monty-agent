@@ -23,7 +23,16 @@ uvx --python 3.15 --from 'monty-agent[tui] @ git+https://github.com/jirikuncar/m
 
 The TUI logs in to Logfire with OAuth (device flow) and runs every turn in Logfire Agent Sandboxes, with model
 requests through the AI Gateway. Nothing is stored locally: each step is a Logfire record, and the conversation list
-is a query. It uses the US region; pass `--remote https://logfire-eu.pydantic.dev/` for the EU one.
+is a query.
+
+It uses the US region by default. Pass `--remote` for another one, or for a self-hosted Logfire with Agent Sandboxes;
+`--gateway` names its AI Gateway (without one, use a model the host has keys for):
+
+```sh
+monty-agent --remote https://logfire-eu.pydantic.dev/
+monty-agent --remote https://logfire.example.com/ --gateway https://gateway.example.com
+monty-agent --remote https://logfire.example.com/ --model openai:gpt-5.2   # OPENAI_API_KEY on the host
+```
 
 ## What runs where
 
