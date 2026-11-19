@@ -1,5 +1,6 @@
 """The TUI against an in-memory stand-in for Logfire: no login, sandbox or network."""
 
+import io
 import json
 import time
 from argparse import Namespace
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from rich.console import Console
 
 pytest.importorskip('textual')
 
@@ -189,7 +191,45 @@ async def test_switch_branches_from_the_palette(monkeypatch: pytest.MonkeyPatch)
         hits[1].command()
         await pilot.pause(0.2)
         assert [w.item.id for w in app.query(tui.Entry)][-2:] == ['p2', 'e2']
-        assert str(app.query_one('#cost', tui.Static).render()).startswith('branch 2/2')
+        assert str(app.query_one('#cost', tui.Static).render()).startswith('branch 1/2')
+
+
+def text(renderable: Any) -> str:
+    console = Console(width=40, record=True, file=io.StringIO())
+    console.print(renderable)
+    return console.export_text()
+
+
+async def test_sidebar_unfolds_the_open_conversation_into_branches(monkeypatch: pytest.MonkeyPatch):
+    fork = [
+        row('d' * 32, '10:10:00', 'f1', 'm1', 'fork', 'gateway/anthropic:m-b', model='m-b'),
+        row('d' * 32, '10:10:04', 'k1', 'f1', 'question', 'Show the code?'),
+    ]
+    app, _ = make_app(monkeypatch, FakeLogfire(CONVERSATION + fork + OTHER), conversation='p1')
+    async with app.run_test() as pilot:
+        await pilot.pause(0.3)
+        panel = app.query_one('#conversations', tui.OptionList)
+        rows = lambda: [panel.get_option_at_index(i).id for i in range(panel.option_count)]
+        on = lambda: panel.get_option_at_index(panel.highlighted).id
+        assert rows() == ['p1', '>m2', '>f1', 'q1']
+        assert on() == '>f1'
+        assert '$0 · ⑂2' in text(panel.get_option_at_index(0).prompt)
+        assert text(panel.get_option_at_index(2).prompt).startswith('└ ⑂ re-run m-b')
+
+        app.action_focus_tree()
+        await pilot.press('left')  # the sibling branch, at its newest node
+        assert (app.selected.id, on()) == ('e2', '>m2')
+        await pilot.press('left')
+        assert app.selected.id == 'k1'
+        await pilot.press('up')  # moving onto a branch row opens that branch
+        await pilot.pause(0.2)
+        assert (app.selected.id, on()) == ('e2', '>m2')
+        await pilot.press('up')  # the conversation row: the branch on screen stays
+        await pilot.pause(0.2)
+        assert (app.selected.id, on()) == ('e2', 'p1')
+
+        app.select(app.nodes['q1'])  # another conversation folds this one up
+        assert rows() == ['p1', 'q1']
 
 
 async def test_sidebar_marks_conversations_updated_since_viewed(monkeypatch: pytest.MonkeyPatch):

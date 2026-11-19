@@ -67,6 +67,7 @@ do run again, so make such tools idempotent.
 | Key            | Does                                                                     |
 | -------------- | ------------------------------------------------------------------------ |
 | click / Enter  | fork from that entry: answer, edit a prompt, re-run a step               |
+| ← / →          | in the sidebar: the other branches from the same fork point              |
 | ctrl+t         | code runs of every branch; Enter opens the branch at that run            |
 | ctrl+o         | expand model steps: which agent, tool results in, reply out              |
 | ctrl+g         | retry the last failed request                                            |

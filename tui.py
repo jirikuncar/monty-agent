@@ -7,8 +7,8 @@ reads the tree back with SQL through the Logfire MCP server. The token is refres
 log in again from the command palette (ctrl+p, "Log in again"). With `--reload`, saving a module next to this one
 reloads the code and restarts the app with the same login.
 
-The sidebar lists conversations; the main pane shows the selected branch, live while a turn runs. Pick a node, then
-type in the composer:
+The sidebar lists conversations, the open one unfolded into its branches; the main pane shows the selected branch,
+live while a turn runs. Pick a node, then type in the composer:
 
 - nothing selected (ctrl+n), or a result: a prompt (a new conversation, or the next turn of that one)
 - a question: the answer (answering again branches)
@@ -303,6 +303,24 @@ def describe(item: Item) -> str:
 
 
 @dataclass
+class Branch:
+    """Nodes from `start` to the next branch point; `start` is the root or one of several children."""
+
+    start: Node
+    nodes: list[Node]
+    """Everything below `start`, in all its branches."""
+    depth: int
+    guides: str
+    """Tree lines before the row, from the branches it hangs under."""
+    leaf: bool
+    siblings: list[Node]
+
+    @property
+    def tip(self) -> Node:
+        return max(self.nodes, key=lambda n: n.at)
+
+
+@dataclass
 class ForkPoint:
     target: Node | None
     """The checkpoint the new branch starts from; None starts a new conversation."""
@@ -386,6 +404,8 @@ class MontyTui(App[str | None]):
         Binding('ctrl+t', 'toggle_code', 'Code runs'),
         Binding('ctrl+g', 'retry', 'Retry failed'),
         Binding('ctrl+y', 'toggle_archive', 'Archive'),  # ctrl+b is the tmux prefix
+        Binding('left', 'sibling(-1)', 'Branch', show=False),
+        Binding('right', 'sibling(1)', 'Branch', show=False),
         Binding('escape', 'focus_tree', 'Conversations', show=False),
         Binding('ctrl+q', 'quit', 'Quit'),
     ]
@@ -412,6 +432,7 @@ class MontyTui(App[str | None]):
         self.seen: dict[str, str] | None = None
         """Conversation -> newest `at` shown in this terminal; set to everything there at the first load."""
         self.rows: dict[str, int] = {}
+        self.order: list[str] = []
         self.project_url: str | None = None
         self.runs_shown: list[Execution] = []
         self.archived: dict[str, tuple[str, bool]] = {}
@@ -888,7 +909,7 @@ class MontyTui(App[str | None]):
             children.setdefault(node.parent if node.parent in self.nodes else None, []).append(node)
         open_root = self.root_of(keep)  # the conversation holding the selection (archived or not)
 
-        # One row per conversation: the transcript shows a branch, the palette switches branches ("Branch: …").
+        # One row per conversation; the open one unfolds into its branches.
         with self.batch_update():
             roots = children.get(None, [])
             hidden = {r.id for r in roots if self.is_archived(r.id) and r.id != open_root and not self.show_archived}
@@ -900,12 +921,95 @@ class MontyTui(App[str | None]):
                 self.seen[open_root] = self.latest[open_root]
             # Most recently updated first, like an inbox.
             order = sorted(conversations, key=lambda r: self.latest[r], reverse=True)
-            self.rows = {root: index for index, root in enumerate(order)}
-            panel.clear_options()
-            panel.add_options(Option(self.row_label(self.nodes[r], conversations[r]), id=r) for r in order)
-            panel.highlighted = self.rows.get(open_root) if open_root else None
+            self.order = order
+            self.fill_sidebar(panel, open_root, None if select else keep)
             if select is not None:
                 self.select(self.nodes[select])
+
+    def fill_sidebar(self, panel: OptionList, open_root: str | None, selected: str | None) -> None:
+        branches = self.branch_tree(self.nodes[open_root]) if open_root in self.nodes else []
+        on = self.branch_of(branches, selected)
+        options, self.rows, highlight = [], {}, None
+        for root in self.order:
+            self.rows[root] = len(options)
+            options.append(Option(self.row_label(self.nodes[root], self.subtree(self.nodes[root])), id=root))
+            if root != open_root:
+                continue
+            highlight = len(options) - 1
+            for branch in branches[1:] if len(branches) > 1 else []:
+                if branch is on:
+                    highlight = len(options)
+                options.append(Option(self.branch_label(branch), id=f'>{branch.start.id}'))
+        scroll = panel.scroll_y
+        panel.clear_options()
+        panel.add_options(options)
+        panel.highlighted = highlight
+        panel.scroll_to(y=scroll, animate=False)
+
+    def branch_tree(self, root: Node) -> list[Branch]:
+        """The conversation cut at its branch points, depth first, oldest branch first."""
+        children: dict[str | None, list[Node]] = {}
+        for node in sorted(self.subtree(root), key=lambda n: n.at):
+            children.setdefault(node.parent, []).append(node)
+        found: list[Branch] = []
+
+        def walk(start: Node, depth: int, guides: str, siblings: list[Node]) -> None:
+            node = start
+            while len(children.get(node.id, [])) == 1:
+                node = children[node.id][0]
+            below = children.get(node.id, [])
+            found.append(Branch(start, self.subtree(start), depth, guides, not below, siblings))
+            for index, child in enumerate(below):
+                last = index == len(below) - 1
+                at = len(found)
+                walk(child, depth + 1, guides + ('  ' if last else '│ '), below)
+                found[at].guides = guides + ('└ ' if last else '├ ')
+
+        walk(root, 0, '', [root])
+        return found
+
+    def branch_of(self, branches: list[Branch], node_id: str | None) -> Branch | None:
+        """The deepest branch holding the node."""
+        node = self.nodes.get(node_id) if node_id else None
+        return max((b for b in branches if node in b.nodes), key=lambda b: b.depth, default=None)
+
+    def branch_label(self, branch: Branch) -> Table:
+        """What started the branch, then how it ended and its cost; ⌘ counts its code runs."""
+        tip, start = branch.tip, branch.start
+        icon, style = ICONS[tip.kind] if tip.kind in STANDING else ('◌', 'yellow')
+        if start.kind == 'fork':
+            title = Text.assemble((ICONS['fork'][0], ICONS['fork'][1]), f' re-run {start.text.rsplit(":", 1)[-1]}')
+        elif start.kind in ('prompt', 'answer'):
+            title = label(start)
+        else:  # the original line past a fork: named by where it ends
+            title, start = label(tip), tip
+        runs = sum(len(self.executions.get(t, [])) for t in {n.trace for n in branch.nodes if n.trace})
+        row = Table.grid(expand=True)
+        row.add_column(no_wrap=True, overflow='ellipsis', ratio=1)
+        row.add_column(justify='right', no_wrap=True)
+        row.add_row(
+            Text.assemble((branch.guides, 'dim'), title),
+            Text.assemble((f'⌘{runs} ' if runs else '', 'dim'), (when(tip.at), 'dim'), ' ', (icon, style)),
+        )
+        if branch.leaf:
+            under = branch.guides[:-2] + ('  ' if branch.guides.endswith('└ ') else '│ ') + '  '
+            outcome = label(tip).plain if tip is not start else ''
+            row.add_row(Text(under + outcome, 'dim'), Text(price(self.cost(branch.nodes)), 'dim'))
+        return row
+
+    def action_sibling(self, step: int) -> None:
+        """The next or previous branch from the same branch point."""
+        root = self.conversation_id()
+        if root is None:
+            return
+        branches = self.branch_tree(self.nodes[root])
+        here = self.branch_of(branches, self.selected.id if self.selected else None)
+        while here is not None and len(here.siblings) < 2:
+            here = self.branch_of(branches, here.start.parent)
+        if here is None:
+            return
+        sibling = here.siblings[(here.siblings.index(here.start) + step) % len(here.siblings)]
+        self.select(max(self.subtree(sibling), key=lambda n: n.at))
 
     def row_label(self, root: Node, nodes: list[Node]) -> Table:
         """Two lines: the first prompt and where the conversation stands; then its cost, and how long ago it changed
@@ -918,9 +1022,12 @@ class MontyTui(App[str | None]):
         row.add_column(no_wrap=True, overflow='ellipsis', ratio=1)
         row.add_column(justify='right', no_wrap=True)
         archived = '▣ archived · ' if self.is_archived(root.id) else ''
+        parents = {n.parent for n in nodes}
+        tips = sum(1 for n in nodes if n.id not in parents)
+        forks = f' · {ICONS["fork"][0]}{tips}' if tips > 1 else ''
         row.add_row(Text(one_line(root.text, 80), 'bold' if unread else ''), Text(f' {icon}', style))
         row.add_row(
-            Text(f'{archived}{price(self.cost(nodes)) or "$0"}', 'dim'),
+            Text(f'{archived}{price(self.cost(nodes)) or "$0"}{forks}', 'dim'),
             Text.assemble(('● ' if unread else '', 'bold cyan'), (when(latest), '' if unread else 'dim')),
         )
         return row
@@ -1006,16 +1113,21 @@ class MontyTui(App[str | None]):
     @on(OptionList.OptionSelected, '#conversations')
     def on_conversation_clicked(self, event: OptionList.OptionSelected) -> None:
         """A click (or enter) opens the conversation at its newest message, even one already on screen."""
-        if (root := self.nodes.get(event.option.id or '')) is not None:
-            self.select(max(self.subtree(root), key=lambda n: n.at))
+        if (start := self.nodes.get((event.option.id or '').removeprefix('>'))) is not None:
+            self.select(max(self.subtree(start), key=lambda n: n.at))
             self.query_one('#composer', Input).focus()
 
     @on(OptionList.OptionHighlighted, '#conversations')
     def on_highlight(self, event: OptionList.OptionHighlighted) -> None:
-        data = self.nodes.get(event.option.id or '')
+        option = event.option.id or ''
+        data = self.nodes.get(option.removeprefix('>'))
         # Highlights arrive as messages: one the list has moved on from (a rebuild, a selection made elsewhere) is
         # not a pick.
         if data is None or event.option_index != event.option_list.highlighted:
+            return
+        if option.startswith('>'):  # a branch row: its newest node, unless the selection is on it already
+            if self.selected not in self.subtree(data):
+                self.select(max(self.subtree(data), key=lambda n: n.at))
             return
         # A conversation shows its newest branch through the last message; a branch of it already on screen (one
         # you were following, or switched to) stays.
@@ -1028,7 +1140,7 @@ class MontyTui(App[str | None]):
         self.fork = None
         self.mark_seen(node)
         root = self.root_of(node.id if node else None)
-        self.query_one('#conversations', OptionList).highlighted = self.rows.get(root) if root else None
+        self.fill_sidebar(self.query_one('#conversations', OptionList), root, node.id if node else None)
         self.show_where()
         transcript = self.query_one('#transcript', VerticalScroll)
         path = []
@@ -1055,9 +1167,10 @@ class MontyTui(App[str | None]):
             ran = f' · {len(executions)} code runs' if executions else ''
             branch, total = price(self.cost(path)), price(self.cost(self.subtree(path[0])))
             costs = f'branch {branch} · conversation {total}' if total else 'no model cost recorded yet'
-            tips = [t.id for t in self.branches()]
-            on = next((i for i, t in enumerate(tips) if self.nodes[t] in self.subtree(path[-1])), None)
-            which = f'branch {on + 1}/{len(tips)} (ctrl+p Branch) · ' if len(tips) > 1 and on is not None else ''
+            tips = [b.tip for b in self.branch_tree(path[0]) if b.leaf]  # in sidebar order
+            below = self.subtree(path[-1])
+            on = max((i for i, t in enumerate(tips) if t in below), key=lambda i: tips[i].at, default=None)
+            which = f'branch {on + 1}/{len(tips)} (← →) · ' if len(tips) > 1 and on is not None else ''
             self.query_one('#cost', Static).update(f'{which}{costs}{ran}')
         else:
             self.query_one('#cost', Static).update('')
