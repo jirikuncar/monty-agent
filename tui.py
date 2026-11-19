@@ -388,7 +388,8 @@ class MontyTui(App[str | None]):
     #cost { height: 1; padding: 0 1; color: $text-muted; }
     #status { height: 1; padding: 0 1; background: $panel; color: $text-muted; }
     #prompt { height: 3; border-top: solid $panel-lighten-1; border-bottom: solid $panel-lighten-1; }
-    #where { width: auto; max-width: 36; padding: 0 1; color: $accent; text-style: bold; }
+    #prompt { border-title-align: right; border-title-color: $accent; border-title-style: bold; }
+    #where { width: auto; padding: 0 1; color: $accent; text-style: bold; }
     #composer { border: none; height: 1; padding: 0; background: $background; }
     #composer:focus { border: none; }
     #code-runs { height: 1fr; border-top: solid $panel-lighten-1; background: $background; display: none; }
@@ -782,11 +783,10 @@ class MontyTui(App[str | None]):
         self.show_where()
 
     def show_where(self) -> None:
-        """The composer names the conversation it continues: its first prompt, shortened."""
+        """The line above the composer names the conversation it continues: its first prompt, shortened."""
         self.query_one('#composer', Input).placeholder = self.placeholder()
         root = self.conversation_id()
-        title = one_line(self.nodes[root].text, 30) if root else 'new conversation'
-        self.query_one('#where', Static).update(Text(f'{title} ❯'))
+        self.query_one('#prompt').border_title = one_line(self.nodes[root].text, 48) if root else 'new conversation'
 
     def placeholder(self) -> str:
         if self.selected is None:

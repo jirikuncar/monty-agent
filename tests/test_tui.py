@@ -99,7 +99,7 @@ async def test_collapsed_conversation_shows_its_last_message(monkeypatch: pytest
         assert app.selected.id == 'e2'
         shown = [w.item.id for w in app.query(tui.Entry)]
         assert shown == ['p1', 'm1', 'm2', 'o1', 'p2', 'e2']
-        assert str(app.query_one('#where', tui.Static).render()) == 'Fibonacci 30? ❯'
+        assert app.query_one('#prompt').border_title == 'Fibonacci 30?'
 
 
 async def test_poll_reads_from_cursor_and_deduplicates(monkeypatch: pytest.MonkeyPatch):
