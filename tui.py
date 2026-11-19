@@ -1,6 +1,6 @@
 """Browse, answer, fork and continue agent conversations kept in Logfire; nothing is stored locally.
 
-    uv run --extra tui tui.py --remote https://logfire-eu.pydantic.info/ --model gateway/anthropic:claude-haiku-5-5
+    uv run --extra tui tui.py --remote https://logfire-us.pydantic.dev/ --model gateway/anthropic:claude-haiku-5-5
 
 Logs in with OAuth (device flow), runs every turn in Agent Sandboxes, saves each checkpoint as a Logfire record and
 reads the tree back with SQL through the Logfire MCP server. The token is refreshed before it expires; if that fails,
@@ -1202,7 +1202,7 @@ Every step is a checkpoint in Logfire: pick one in the sidebar to answer, contin
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--remote', default='https://logfire-eu.pydantic.info/', help='Logfire backend URL')
+    parser.add_argument('--remote', default='https://logfire-us.pydantic.dev/', help='Logfire backend URL')
     parser.add_argument('--model', default='gateway/anthropic:claude-haiku-5-5')
     parser.add_argument('--script', type=Path, default=Path(__file__).parent / 'examples' / 'general_agent.py')
     parser.add_argument('--workspace', type=Path, help='seed files for new conversations')

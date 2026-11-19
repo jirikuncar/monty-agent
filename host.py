@@ -528,7 +528,7 @@ def main() -> None:
         '--suspend-at', type=int, metavar='N', help='stop before the N-th model request (needs --checkpoints)'
     )
     parser.add_argument(
-        '--remote', metavar='URL', help='run in Logfire Agent Sandboxes, e.g. https://logfire-eu.pydantic.info/'
+        '--remote', metavar='URL', help='run in Logfire Agent Sandboxes, e.g. https://logfire-us.pydantic.dev/'
     )
     parser.add_argument(
         '--ask',

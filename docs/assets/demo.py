@@ -182,12 +182,12 @@ async def record() -> Recorder:
     replay = Replay(data)
     tui.McpQuery = lambda *args, **kwargs: replay
     args = Namespace(
-        remote='https://logfire-eu.pydantic.dev/',
+        remote='https://logfire-us.pydantic.dev/',
         model='gateway/anthropic:claude-haiku-5-5',
         script=Path('examples/general_agent.py'),
         poll=0,
     )
-    login = Login('https://logfire-eu.pydantic.dev', 'demo', time.time() + 86400, 'demo', 'https://example.invalid')
+    login = Login('https://logfire-us.pydantic.dev', 'demo', time.time() + 86400, 'demo', 'https://example.invalid')
     app = tui.MontyTui(args, login)
     turns = list(replay.live)
     app.run_turn = lambda node, text: app.run_worker(replay_turn(app, replay, turns.pop(0), text), group='turns')

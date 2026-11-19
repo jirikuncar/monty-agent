@@ -2,7 +2,7 @@
 
     uv run examples/suspend_fork.py
     uv run examples/suspend_fork.py --model gateway/anthropic:claude-haiku-5-5 --fork-model ollama:qwen3.5:latest
-    uv run --extra remote examples/suspend_fork.py --remote https://logfire-eu.pydantic.info/ ...
+    uv run --extra remote examples/suspend_fork.py --remote https://logfire-us.pydantic.dev/ ...
 
 Every step is a checkpoint taken before a model request. The workspace lives in memory and travels with each
 checkpoint, so a restart or fork sees the files exactly as they were at that step.
