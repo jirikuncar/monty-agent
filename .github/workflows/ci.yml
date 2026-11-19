@@ -8,15 +8,59 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
-      - run: uv sync --locked
-      - run: uv run ruff format --check
-      - run: uv run ruff check
-      - run: uv run pytest
+      - run: uv lock --check
+      - run: uv run --locked --only-group dev ruff format --check
+      - run: uv run --locked --only-group dev ruff check
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        extras: ['', '--all-extras']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+      - run: uv sync --locked ${{ matrix.extras }}
+      - run: uv run --no-sync pytest -ra
+
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+      - run: uv sync --locked --all-extras
+      - run: uv run --no-sync pytest -ra -m slow
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+      - run: uv build
+      - name: Entry points run from the wheel
+        run: |
+          uv venv /tmp/wheel
+          uv pip install --python /tmp/wheel "$(echo dist/*.whl)[tui]"
+          /tmp/wheel/bin/monty-agent --help
+          /tmp/wheel/bin/monty-agent-host --help

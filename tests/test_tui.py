@@ -65,11 +65,11 @@ class FakeLogfire:
 def make_app(monkeypatch: pytest.MonkeyPatch, logfire: FakeLogfire, **options: Any) -> tuple[tui.MontyTui, list]:
     monkeypatch.setattr(tui, 'McpQuery', lambda *args, **kwargs: logfire)
     args = Namespace(
-        remote='https://logfire-eu.pydantic.info/', model='test', script=Path('examples/general_agent.py'), poll=0
+        remote='https://logfire-us.pydantic.dev/', model='test', script=Path('examples/general_agent.py'), poll=0
     )
     for key, value in options.items():
         setattr(args, key, value)
-    login = Login('https://logfire-eu.pydantic.info', 'token', time.time() + 3600, 'client', 'https://e/token', 'r')
+    login = Login('https://logfire-us.pydantic.dev', 'token', time.time() + 3600, 'client', 'https://e/token', 'r')
     app = tui.MontyTui(args, login)
     launched: list[tuple[str | None, str]] = []
     app.run_turn = lambda node, text: launched.append((node and node.id, text))  # no sandbox
@@ -318,3 +318,22 @@ async def test_option_click_opens_the_span(monkeypatch: pytest.MonkeyPatch):
 
 async def _async(value: Any) -> Any:
     return value
+
+
+async def test_turn_from_a_picked_step_follows_the_new_branch(monkeypatch: pytest.MonkeyPatch):
+    app, launched = make_app(monkeypatch, FakeLogfire(CONVERSATION), conversation='p1')
+    async with app.run_test() as pilot:
+        await pilot.pause(0.3)
+        assert app.selected.id == 'e2'
+        app.pick(app.nodes['m1'], None)
+        await pilot.press('enter')  # re-run the model step
+        await pilot.pause(0.2)
+        assert launched == [('m1', '')]
+        assert app.selected.id == 'm1' and app.fork is None
+        assert [w.item.id for w in app.query(tui.Entry)] == ['p1', 'm1']
+
+        await pilot.press('ctrl+n')
+        app.query_one('#composer', tui.Input).value = 'fresh start'
+        await pilot.press('enter')
+        await pilot.pause(0.2)
+        assert launched[-1] == (None, 'fresh start') and app.selected is None
